@@ -1,106 +1,136 @@
 # lsu-cmp
 
-Firmware ESP32-C3 care ascultă pasiv (listen-only) magistrala CAN de pe
-OBD2 și trimite fiecare cadru, încadrat ASAM CMP, prin UDP peste WiFi către
-un laptop. Specificația completă: [SPEC.md](SPEC.md).
+ESP32-C3 firmware that passively listens (listen-only) to the CAN bus on the
+OBD2 connector and sends every frame, wrapped in ASAM CMP, over UDP and WiFi
+to a laptop. Full specification: [SPEC.md](SPEC.md).
 
-## Decizii (SPEC.md §6)
+## Hardware
 
-| Decizie | Alegere |
+- ESP32-C3-MINI dev board, flashed and logged over the ESP32-C3's native USB
+  (USB ID 303A:1001, no separate USB-serial chip), hence
+  `ARDUINO_USB_MODE=1` / `ARDUINO_USB_CDC_ON_BOOT=1` in
+  [platformio.ini](platformio.ini).
+- WCMCU-230 CAN transceiver (SN65HVD230), powered from the ESP32's 3V3.
+- MP1584EN step-down, 12 V from OBD2 pin 16 to 5 V for the ESP32.
+- No 120 Ω termination on this node (the vehicle bus is already terminated).
+
+Pin-by-pin wiring: [SPEC.md §2](SPEC.md#2-hardware-confirmed-wired). The
+CAN GPIOs are in [src/config.h](src/config.h): TX = GPIO1 (CTX, unused in
+listen-only mode), RX = GPIO3 (CRX).
+
+Things to keep in mind (not yet measured or verified):
+
+- **OBD2 pin 16 is permanent +12 V**, also with the ignition off. The board
+  stays powered with WiFi on, estimated at 30–50 mA from the 12 V battery,
+  about 1 Ah per day. Fine for days, not for weeks: unplug it, or add a
+  low-power mode for when the bus is silent, if it stays installed.
+- **The MQB gateway (J533) most likely does not forward the car's normal
+  traffic to OBD2 pins 6/14.** The diagnostic bus usually carries only
+  tester requests and responses, so in listen-only mode there may be little
+  or no traffic unless a tester (VCDS, OBD Eleven, ...) is active at the same
+  time. If the client shows 0 frames with STATUS `CAN running` and 0 bus
+  errors, this is the likely cause, not wiring or bitrate.
+
+## Decisions (SPEC.md §6)
+
+| Decision | Choice |
 |---|---|
-| Toolchain | PlatformIO, framework Arduino; TWAI prin `driver/twai.h` din ESP-IDF |
-| deviceId / streamId | 1 / 1 — alese local, **nu** dintr-un registru oficial ASAM |
-| Port UDP | 12670 — arbitrar, **nu** un port IANA standard pentru CMP |
-| Destinație | model cu abonare: laptopul se abonează la ESP, ESP trimite unicast la abonat |
-| WiFi | biblioteca [LsuWifi](README-WIFI.md); AP implicit `lsu-cmp` / `12345678` pe `10.10.10.10` |
-| interfaceId | 0 — arbitrar, un singur canal CAN fizic |
-| Timestamp | ora laptopului, transmisă în fiecare SUBSCRIBE |
+| Toolchain | PlatformIO, Arduino framework; TWAI through ESP-IDF's `driver/twai.h` |
+| deviceId / streamId | 1 / 1, chosen locally, **not** from an official ASAM registry |
+| UDP port | 12670, arbitrary, **not** an IANA-registered port for CMP |
+| Destination | subscription model: the laptop subscribes to the ESP32, which sends unicast to the subscriber |
+| WiFi | [LsuWifi](README-WIFI.md) library; default AP `lsu-cmp` / `12345678` at `10.10.10.10` |
+| interfaceId | 0, arbitrary, a single physical CAN channel |
+| Timestamp | laptop time, sent in every SUBSCRIBE |
 
-Configurația e în [src/config.h](src/config.h).
+The configuration is in [src/config.h](src/config.h).
 
-## Protocolul de abonare (propriu, nu face parte din ASAM CMP)
+## Subscription protocol (own, not part of ASAM CMP)
 
-UDP port 12670, big-endian. Definiția comună pentru firmware și clientul
-C++: [lib/LsuProtocol/src/lsu_protocol.h](lib/LsuProtocol/src/lsu_protocol.h).
+UDP port 12670, big-endian. One definition shared by the firmware and the
+C++ client: [lib/LsuProtocol/src/lsu_protocol.h](lib/LsuProtocol/src/lsu_protocol.h).
 
-| Mesaj | Direcție | Conținut |
+| Message | Direction | Content |
 |---|---|---|
-| SUBSCRIBE | laptop → ESP | `"LSUS"` + uint64 ora laptopului, ns de la epoch Unix (12 octeți) |
-| UNSUBSCRIBE | laptop → ESP | `"LSUU"` (4 octeți) |
-| STATUS | ESP → laptop | `"LSUA"` + versiune + starea CAN și contoare (40 octeți), răspuns la fiecare SUBSCRIBE |
+| SUBSCRIBE | laptop → ESP32 | `"LSUS"` + uint64 laptop time, ns since the Unix epoch (12 bytes) |
+| UNSUBSCRIBE | laptop → ESP32 | `"LSUU"` (4 bytes) |
+| STATUS | ESP32 → laptop | `"LSUA"` + version + CAN state and counters (40 bytes), reply to every SUBSCRIBE |
 
-- Ultimul expeditor al unui SUBSCRIBE devine singurul abonat.
-- Laptopul retrimite SUBSCRIBE la 1 s; după 5 s fără SUBSCRIBE abonatul expiră
-  și ESP-ul nu mai trimite nimic.
-- La fiecare SUBSCRIBE ESP-ul își recalculează offsetul de ceas. Timestamp-ul
-  CMP e momentul recepției cadrului CAN în ora laptopului, cu precizie de
-  ordinul latenței WiFi (câteva ms, fără compensare). Fără abonat nu se
-  trimite nimic, deci toate pachetele au flag-ul `insync`.
-- Pachetele CMP pleacă de pe portul 12670 către IP:portul abonatului.
-- STATUS conține: starea controllerului CAN (running / bus-off / ...),
-  bitrate, cadre primite, pachete trimise, cadre pierdute (cozi pline,
-  overrun), erori de trimitere UDP, erori de magistrală, uptime. Clientul
-  deosebește astfel „ESP inaccesibil” de „magistrală fără trafic”.
+- The latest sender of a SUBSCRIBE becomes the only subscriber.
+- The laptop resends SUBSCRIBE every second. After 5 s without one the
+  subscriber expires and the ESP32 stops sending.
+- On every SUBSCRIBE the ESP32 recomputes its clock offset. The CMP timestamp
+  is the moment the CAN frame was received, in laptop time, accurate to about
+  the WiFi latency (a few ms, no compensation). Nothing is sent without a
+  subscriber, so every packet carries the `insync` flag.
+- CMP packets are sent from port 12670 to the subscriber's IP:port.
+- STATUS holds the CAN controller state (running / bus-off / ...), bitrate,
+  frames received, packets sent, frames dropped (full queues, overrun), UDP
+  send errors, bus errors and uptime. This lets the client tell an
+  unreachable ESP32 from a silent bus.
 
-## Formatul CMP
+## CMP format
 
-Un cadru CAN = un datagram UDP de 40–48 octeți (CmpHeader + MessageHeader +
-payload CAN), conform SPEC.md §4, cu o precizare față de SPEC: masca
-`0xFFFFFF1F` din biblioteca openDAQ se aplică pe cuvântul brut citit pe un
-host little-endian. Pe fir (big-endian) câmpul `id` are ID-ul în biții
-0–28, `rsvd` = bit 29, `RTR` = bit 30, `IDE` = bit 31. Encoderul
-([lib/CmpCodec](lib/CmpCodec/src/cmp_encoder.h)) a fost verificat octet
-cu octet față de pachete construite cu openDAQ/ASAM-CMP-Library.
+One CAN frame = one UDP datagram of 40–48 bytes (CmpHeader + MessageHeader +
+CAN payload), as in SPEC.md §4, with one clarification: the `0xFFFFFF1F` mask
+in the openDAQ library is applied to the raw word as read on a little-endian
+host. On the wire (big-endian) the `id` field holds the ID in bits 0–28,
+`rsvd` in bit 29, `RTR` in bit 30 and `IDE` in bit 31. The encoder
+([lib/CmpCodec](lib/CmpCodec/src/cmp_encoder.h)) was checked byte for byte
+against packets built with openDAQ/ASAM-CMP-Library.
 
-Câmpul `crc` e 0, cu `crcSupport`/`sbcSupport` = 0 (nesuportat): TWAI nu
-expune CRC-ul sau numărul de biți de umplere ai cadrului recepționat. Flag-ul
-`overflow` e setat pe primul pachet de după cadre pierdute din coada internă.
+The `crc` field is 0, with `crcSupport`/`sbcSupport` = 0 (not supported):
+TWAI does not expose the CRC or the stuff bit count of a received frame. The
+`overflow` flag is set on the first packet after frames were dropped from
+the internal queue.
 
-## Utilizare
+## Usage
 
-1. Build și upload prin WiFi (OTA, implicit către 192.168.100.240):
-   `pio run -t upload`. În modul AP: `--upload-port 10.10.10.10`. Prin USB
-   (primul flash sau recuperare): `pio run -e usb -t upload`. Cât timp o
-   actualizare OTA e în curs, trimiterea CMP se oprește.
-2. Acasă se conectează ca station la routerul salvat (rezervare DHCP
-   192.168.100.240). Unde nu e nicio rețea salvată în raza, pornește AP-ul
-   `lsu-cmp`. Laptopul se conectează la el; din `http://10.10.10.10` se pot
-   adăuga rețele externe (vezi [README-WIFI.md](README-WIFI.md)).
-3. Pe laptop, clientul de test C++ (Linux):
+1. Build and upload over WiFi (OTA, to 192.168.100.240 by default):
+   `pio run -t upload`. In AP mode: `--upload-port 10.10.10.10`. Over USB
+   (first flash or recovery): `pio run -e usb -t upload`. CMP streaming
+   stops while an OTA update is in progress.
+2. At home the board connects as a station to the saved router (DHCP
+   reservation 192.168.100.240). Where no saved network is in range it
+   starts the `lsu-cmp` AP. Connect the laptop to it; more networks can be
+   added at `http://10.10.10.10` (see [README-WIFI.md](README-WIFI.md)).
+3. On the laptop, the C++ test client (Linux):
    ```
    cmake -S tools/cmp_client -B tools/cmp_client/build && cmake --build tools/cmp_client/build
    tools/cmp_client/build/cmp_client 192.168.100.240
    ```
-   Fără IP folosește `10.10.10.10` (modul AP); `--quiet` afișează doar
-   cadre/s, pierderile și starea CAN. Afișează fiecare cadru CAN (ora capturii, seq, `age` = cât a durat de la
-   captură pe ESP până la laptop, ID, DLC, date), golurile din secvență, și
-   starea ESP-ului la abonare și orice schimbare (stare CAN, erori de
-   magistrală, cadre pierdute, restart), „no reply from ESP32” când nu vine
-   STATUS 3 s, și un rezumat la 5 s când nu vin cadre CAN.
-4. Validare (SPEC.md §7): Wireshark pe aceeași interfață, *Decode As…* UDP
-   port 12670 → ASAM CMP.
+   Without an IP it uses `10.10.10.10` (AP mode); `--quiet` prints only
+   frames/s, losses and the CAN state. It prints every CAN frame (capture
+   time, seq, `age` = time from capture on the ESP32 to arrival on the
+   laptop, ID, DLC, data), sequence gaps, the ESP32 state at subscription
+   and every change (CAN state, bus errors, dropped frames, restart), "no
+   reply from ESP32" after 3 s without STATUS, and a summary every 5 s while
+   no CAN frames arrive.
+4. Validation (SPEC.md §7): Wireshark on the same interface, *Decode As…*
+   UDP port 12670 → ASAM CMP.
 
-Logul: `pio device monitor` prin WiFi (TCP port 23, implicit către
-192.168.100.240; în modul AP `--port socket://10.10.10.10:23`), sau
-`pio device monitor -e usb` prin USB. La conectare prin TCP se retrimit
-ultimii 4 KB de log (inclusiv mesajele de la boot); un singur client TCP
-odată, fără parolă. Mesajele interne LsuWifi apar doar pe USB. Logul afișează la 5 s statisticile: cadre primite, pierdute, trimise,
-erori de trimitere și contoarele TWAI (`bus_err`). Dacă `bus_err` crește
-mult, încearcă 250 kbit/s: `build_flags = -DCAN_BITRATE_KBPS=250`.
+Log: `pio device monitor` over WiFi (TCP port 23, 192.168.100.240 by
+default; in AP mode `--port socket://10.10.10.10:23`), or
+`pio device monitor -e usb` over USB. A TCP client gets the last 4 KB of log
+on connect (including the boot messages); one TCP client at a time, no
+password. LsuWifi's own messages only go to USB. Every 5 s the log prints
+the statistics: frames received, dropped and sent, send errors and the TWAI
+counters (`bus_err`). If `bus_err` grows a lot, try 250 kbit/s:
+`build_flags = -DCAN_BITRATE_KBPS=250`.
 
-## Clientul de test și baza pentru clienți ulteriori
+## Test client and base for later clients
 
 [tools/cmp_client/](tools/cmp_client/) (C++17, Linux, CMake):
 
-| Fișier | Rol |
+| File | Role |
 |---|---|
-| [cmp_subscriber.h](tools/cmp_client/cmp_subscriber.h) / `.cpp` | Partea refolosibilă: socket, SUBSCRIBE periodic, STATUS, numărare secvență, detectare ESP inaccesibil. Fără output, fără thread-uri; evenimente prin callback-uri (`onFrame`, `onGap`, `onStatus`, `onUnreachable`, `onReachable`, `onUnknownPacket`). |
-| [main.cpp](tools/cmp_client/main.cpp) | Clientul de test: linia de comandă și afișarea callback-urilor. |
-| [lib/CmpCodec](lib/CmpCodec/src/) | Encoder (firmware) și decoder (client) CMP, comune. |
-| [lib/LsuProtocol](lib/LsuProtocol/src/lsu_protocol.h) | Protocolul de abonare, comun. |
+| [cmp_subscriber.h](tools/cmp_client/cmp_subscriber.h) / `.cpp` | The reusable part: socket, periodic SUBSCRIBE, STATUS, sequence tracking, unreachable detection. No output, no threads; events through callbacks (`onFrame`, `onGap`, `onStatus`, `onUnreachable`, `onReachable`, `onUnknownPacket`). |
+| [main.cpp](tools/cmp_client/main.cpp) | The test client: command line and printing of the callbacks. |
+| [lib/CmpCodec](lib/CmpCodec/src/) | CMP encoder (firmware) and decoder (client), shared. |
+| [lib/LsuProtocol](lib/LsuProtocol/src/lsu_protocol.h) | The subscription protocol, shared. |
 
-CMake construiește partea refolosibilă ca bibliotecă statică
-`cmp_subscriber` (CmpSubscriber + decoder), cu care se leagă `cmp_client`.
-Un client nou folosește aceleași surse și își scrie propriul `main`.
+CMake builds the reusable part as the static library `cmp_subscriber`
+(CmpSubscriber + decoder), which `cmp_client` links against. A new client
+uses the same sources and writes its own `main`.
 
-Teste pe host (encoder, decoder, protocol): `pio test -e native`.
+Host tests (encoder, decoder, protocol): `pio test -e native`.
