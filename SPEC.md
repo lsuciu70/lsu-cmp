@@ -86,6 +86,8 @@ offset  size  field
 - bit masked with `0x40` = RTR/RRS (remote request)
 - bit masked with `0x80` = IDE (extended ID, 29-bit vs 11-bit)
 
+> **Note (added after implementation):** these masks apply to the raw 32-bit word as read by the library on a little-endian host, not to the big-endian value on the wire. On the wire the `id` field holds the CAN ID in bits 0–28, `rsvd` in bit 29, `RTR` in bit 30 and `IDE` in bit 31. See [README.md, "CMP format"](README.md#cmp-format).
+
 **Bit packing of the `crc` field (4 bytes, offset 8):** holds the CAN CRC + CRC support + SBC (stuff bit count) + parity. Fine details, less critical for a simple sender (we can put 0 if we do not compute the real CRC of the received frame; the ESP32 TWAI does not expose the raw frame CRC through the standard API; to be checked during implementation whether any workaround exists or whether it is left 0/unsupported).
 
 **Flags (offset 0, 2 bytes):** per-frame error bits: crcErr=0x0001, ackErr=0x0002, passiveAckErr=0x0004, activeAckErr=0x0008, ackDelErr=0x0010, formErr=0x0020, stuffErr=0x0040, crcDelErr=0x0080, eofErr=0x0100, bitErr=0x0200, rsvd=0x0400, srrDom=0x0800, brs=0x1000 (CAN-FD, not applicable), esi=0x2000 (CAN-FD, not applicable).
