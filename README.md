@@ -63,6 +63,14 @@ expune CRC-ul sau numărul de biți de umplere ai cadrului recepționat. Flag-ul
 3. Pe laptop: `tools/cmp_client.py` (implicit `10.10.10.10`), sau
    `tools/cmp_client.py <IP>` în modul station. `--quiet` afișează doar
    cadre/s și pierderile.
+   Client C++ (Linux), cu aceleași opțiuni:
+   ```
+   cmake -S tools/cmp_client -B tools/cmp_client/build && cmake --build tools/cmp_client/build
+   tools/cmp_client/build/cmp_client 192.168.100.240
+   ```
+   Afișează fiecare cadru CAN (ora capturii, seq, `age` = cât a durat de la
+   captură pe ESP până la laptop, ID, DLC, date), golurile din secvență, și
+   un mesaj la 5 s când nu vine nimic.
 4. Validare (SPEC.md §7): Wireshark pe aceeași interfață, *Decode As…* UDP
    port 12670 → ASAM CMP.
 
