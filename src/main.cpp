@@ -4,14 +4,12 @@
 //   capture  - TWAI in listen-only mode, timestamps frames, queues them
 //              while a subscriber is active (SPEC.md §5.1)
 //   sender   - one CMP packet per CAN frame, UDP to the subscriber (§5.2)
-//   control  - receives SUBSCRIBE / UNSUBSCRIBE on the UDP port
+//   control  - receives SUBSCRIBE / UNSUBSCRIBE on the UDP port, replies
+//              STATUS to every SUBSCRIBE
 //   loop()   - LsuWifi web UI, ArduinoOTA, TCP log client and a periodic
 //              stats log (net_log.h: USB serial + TCP port kLogTcpPort)
 //
-// Subscription protocol (own, not part of ASAM CMP), PC -> ESP UDP port
-// kUdpPort, big-endian:
-//   SUBSCRIBE   "LSUS" + uint64 laptop time, ns since Unix epoch (12 bytes)
-//   UNSUBSCRIBE "LSUU" (4 bytes)
+// Subscription protocol (own, not part of ASAM CMP): lsu_protocol.h.
 // The sender of the latest SUBSCRIBE becomes the only subscriber, and the
 // clock offset is reset from its time on every SUBSCRIBE. CMP timestamps are
 // therefore laptop time, accurate to about the WiFi latency (a few ms; no
@@ -27,6 +25,7 @@
 
 #include "cmp_encoder.h"
 #include "config.h"
+#include "lsu_protocol.h"
 #include "net_log.h"
 
 namespace {
@@ -42,9 +41,6 @@ struct Subscriber {
   int64_t offsetNs = 0;  // laptop time - esp_timer time
   int64_t lastSeenUs = 0;
 };
-
-constexpr uint8_t kMagicSubscribe[4] = {'L', 'S', 'U', 'S'};
-constexpr uint8_t kMagicUnsubscribe[4] = {'L', 'S', 'U', 'U'};
 
 const cmp::StreamConfig kStream = {kCmpDeviceId, kCmpStreamId, kCmpInterfaceId};
 
@@ -76,12 +72,6 @@ bool subscriberActive() {
   bool active = subscriber.active;
   portEXIT_CRITICAL(&subMux);
   return active;
-}
-
-uint64_t get64(const uint8_t* p) {
-  uint64_t v = 0;
-  for (int i = 0; i < 8; i++) v = (v << 8) | p[i];
-  return v;
 }
 
 bool sameAddr(const sockaddr_in& a, const sockaddr_in& b) {
@@ -183,6 +173,29 @@ void senderTask(void*) {
   }
 }
 
+lsu::Status currentStatus() {
+  twai_status_info_t st{};
+  twai_get_status_info(&st);
+  lsu::Status s;
+  s.canState = st.state;
+  s.bitrateKbps = CAN_BITRATE_KBPS;
+  s.canRx = statRx;
+  s.sent = statSent;
+  s.queueFull = statQueueFull;
+  s.sendErrors = statSendErr;
+  s.busErrors = st.bus_error_count;
+  s.rxMissed = st.rx_missed_count;
+  s.rxOverrun = st.rx_overrun_count;
+  s.uptimeS = esp_timer_get_time() / 1000000;
+  return s;
+}
+
+void sendStatus(const sockaddr_in& to) {
+  uint8_t buf[lsu::kStatusSize];
+  lsu::encodeStatus(currentStatus(), buf);
+  sendto(udpSocket, buf, sizeof(buf), 0, (const sockaddr*)&to, sizeof(to));
+}
+
 void controlTask(void*) {
   uint8_t buf[32];
   for (;;) {
@@ -192,20 +205,21 @@ void controlTask(void*) {
     int64_t nowUs = esp_timer_get_time();
     char ip[16];
 
-    if (n == 12 && memcmp(buf, kMagicSubscribe, 4) == 0 && !otaInProgress) {
-      int64_t laptopNs = (int64_t)get64(buf + 4);
+    uint64_t laptopNs;
+    if (n > 0 && lsu::decodeSubscribe(buf, n, laptopNs) && !otaInProgress) {
       portENTER_CRITICAL(&subMux);
       bool isNew = !subscriber.active || !sameAddr(subscriber.addr, from);
       subscriber.active = true;
       subscriber.addr = from;
-      subscriber.offsetNs = laptopNs - nowUs * 1000;
+      subscriber.offsetNs = (int64_t)laptopNs - nowUs * 1000;
       subscriber.lastSeenUs = nowUs;
       portEXIT_CRITICAL(&subMux);
       if (isNew) {
         inet_ntoa_r(from.sin_addr, ip, sizeof(ip));
         netLog.printf("[sub] subscriber %s:%u\n", ip, ntohs(from.sin_port));
       }
-    } else if (n == 4 && memcmp(buf, kMagicUnsubscribe, 4) == 0) {
+      sendStatus(from);
+    } else if (n > 0 && lsu::isUnsubscribe(buf, n)) {
       portENTER_CRITICAL(&subMux);
       bool removed = subscriber.active && sameAddr(subscriber.addr, from);
       if (removed) subscriber.active = false;
@@ -223,20 +237,18 @@ void controlTask(void*) {
 }
 
 void logStats() {
-  twai_status_info_t st{};
-  twai_get_status_info(&st);
-  static const char* kStates[] = {"stopped", "running", "bus-off", "recovering"};
-  Subscriber s = getSubscriber();
+  lsu::Status st = currentStatus();
+  Subscriber sub = getSubscriber();
   char ip[16] = "-";
-  if (s.active) inet_ntoa_r(s.addr.sin_addr, ip, sizeof(ip));
+  if (sub.active) inet_ntoa_r(sub.addr.sin_addr, ip, sizeof(ip));
   netLog.printf(
       "[stats] can=%s rx=%lu no_sub=%lu q_full=%lu sent=%lu send_err=%lu | "
       "twai missed=%lu overrun=%lu bus_err=%lu | sub=%s\n",
-      st.state <= TWAI_STATE_RECOVERING ? kStates[st.state] : "?",
-      (unsigned long)statRx, (unsigned long)statNoSubscriber,
-      (unsigned long)statQueueFull, (unsigned long)statSent,
-      (unsigned long)statSendErr, (unsigned long)st.rx_missed_count,
-      (unsigned long)st.rx_overrun_count, (unsigned long)st.bus_error_count, ip);
+      lsu::canStateName(st.canState), (unsigned long)st.canRx,
+      (unsigned long)statNoSubscriber, (unsigned long)st.queueFull,
+      (unsigned long)st.sent, (unsigned long)st.sendErrors,
+      (unsigned long)st.rxMissed, (unsigned long)st.rxOverrun,
+      (unsigned long)st.busErrors, ip);
 }
 
 void startOta() {

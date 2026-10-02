@@ -1,9 +1,10 @@
 // Test client for the lsu-cmp ESP32: subscribes and prints CAN frames.
 //
-// Sends SUBSCRIBE ("LSUS" + this machine's time, ns since the Unix epoch)
-// every second, which also keeps the ESP32 clock in sync with this machine,
-// and UNSUBSCRIBE ("LSUU") on Ctrl+C. Decodes the ASAM CMP data packets,
-// reports sequenceCounter gaps, and prints a status line when nothing arrives.
+// Sends SUBSCRIBE (with this machine's time, which keeps the ESP32 clock in
+// sync) every second and UNSUBSCRIBE on Ctrl+C; protocol in lsu_protocol.h.
+// Decodes the ASAM CMP data packets and reports sequenceCounter gaps. The
+// STATUS reply to each SUBSCRIBE shows whether the ESP32 is reachable and
+// the state of its CAN controller; changes and idle periods are printed.
 //
 // Usage: cmp_client [host] [--port 12670] [--quiet]
 
@@ -23,11 +24,14 @@
 #include <string>
 
 #include "cmp_encoder.h"
+#include "lsu_protocol.h"
 
 namespace {
 
 constexpr int kSubscribeIntervalMs = 1000;
 constexpr int kIdleReportMs = 5000;
+// No STATUS for this long: the ESP32 is considered unreachable.
+constexpr int kStatusTimeoutMs = 3000;
 
 volatile std::sig_atomic_t stopRequested = 0;
 
@@ -111,19 +115,50 @@ void printFrame(const Frame& f) {
          (f.commonFlags & cmp::kFlagOverflow) ? "  OVERFLOW" : "");
 }
 
+struct EspState {
+  bool known = false;
+  int64_t lastStatusMs = 0;
+  lsu::Status st{};
+};
+
+// Prints what changed since the previous STATUS.
+void handleStatus(EspState& esp, const lsu::Status& st) {
+  const lsu::Status& old = esp.st;
+  if (!esp.known) {
+    printf("subscribed: ESP32 up %us, CAN %s at %u kbit/s, %u frames received, "
+           "%u bus errors\n",
+           st.uptimeS, lsu::canStateName(st.canState), st.bitrateKbps, st.canRx, st.busErrors);
+  } else if (st.uptimeS < old.uptimeS) {
+    printf("! ESP32 restarted (up %us)\n", st.uptimeS);
+  } else {
+    if (st.canState != old.canState)
+      printf("! CAN state: %s -> %s\n", lsu::canStateName(old.canState),
+             lsu::canStateName(st.canState));
+    if (st.busErrors > old.busErrors)
+      printf("! CAN bus errors: +%u (total %u)\n", st.busErrors - old.busErrors, st.busErrors);
+    uint32_t dropped = (st.rxMissed + st.rxOverrun + st.queueFull) -
+                       (old.rxMissed + old.rxOverrun + old.queueFull);
+    if (dropped) printf("! ESP32 dropped %u frame(s) (receive queues full)\n", dropped);
+    if (st.sendErrors > old.sendErrors)
+      printf("! ESP32 UDP send errors: +%u\n", st.sendErrors - old.sendErrors);
+  }
+  esp.known = true;
+  esp.st = st;
+}
+
 void usage(const char* prog) {
   fprintf(stderr, "Usage: %s [host] [--port N] [--quiet]\n"
                   "  host     ESP32 IP (default 10.10.10.10, AP mode)\n"
                   "  --port   UDP port (default %u)\n"
                   "  --quiet  only a summary line every second\n",
-          prog, 12670);
+          prog, lsu::kDefaultPort);
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
   std::string host = "10.10.10.10";
-  std::string port = "12670";
+  std::string port = std::to_string(lsu::kDefaultPort);
   bool quiet = false;
   for (int i = 1; i < argc; i++) {
     std::string a = argv[i];
@@ -173,13 +208,15 @@ int main(int argc, char** argv) {
   int64_t lastPacket = monoMs();
   int64_t lastReport = monoMs();
   int64_t lastIdle = monoMs();
+  const int64_t startMs = monoMs();
+  EspState espState;
+  bool reportedUnreachable = false;
 
   while (!stopRequested) {
     int64_t now = monoMs();
     if (now >= nextSubscribe) {
-      uint8_t msg[12] = {'L', 'S', 'U', 'S'};
-      uint64_t t = nowNs();
-      for (int i = 0; i < 8; i++) msg[4 + i] = uint8_t(t >> (56 - 8 * i));
+      uint8_t msg[lsu::kSubscribeSize];
+      lsu::encodeSubscribe(nowNs(), msg);
       if (send(sock, msg, sizeof(msg), 0) < 0) perror("send SUBSCRIBE");
       nextSubscribe = now + kSubscribeIntervalMs;
     }
@@ -192,6 +229,17 @@ int main(int argc, char** argv) {
       if (n < 0) {
         // ECONNREFUSED: ICMP port unreachable, nothing listening yet.
         if (errno != ECONNREFUSED) perror("recv");
+      } else if (lsu::isStatus(buf, size_t(n))) {
+        lsu::Status st;
+        if (lsu::decodeStatus(buf, size_t(n), st)) {
+          if (reportedUnreachable) printf("ESP32 reachable again\n");
+          reportedUnreachable = false;
+          handleStatus(espState, st);
+          espState.lastStatusMs = monoMs();
+        } else {
+          bad++;
+          printf("? STATUS with unknown version/size (%zd bytes)\n", n);
+        }
       } else {
         Frame f;
         if (!decode(buf, size_t(n), f)) {
@@ -216,20 +264,30 @@ int main(int argc, char** argv) {
 
     now = monoMs();
     if (quiet && now - lastReport >= 1000) {
-      printf("%llu frames/s, %llu total, %llu lost\n", (unsigned long long)perSecond,
-             (unsigned long long)total, (unsigned long long)lost);
+      printf("%llu frames/s, %llu total, %llu lost | CAN %s, bus errors %u\n",
+             (unsigned long long)perSecond, (unsigned long long)total, (unsigned long long)lost,
+             espState.known ? lsu::canStateName(espState.st.canState) : "?",
+             espState.st.busErrors);
       perSecond = 0;
       lastReport = now;
     }
+    int64_t sinceStatus = now - (espState.known ? espState.lastStatusMs : startMs);
+    if (sinceStatus >= kStatusTimeoutMs && !reportedUnreachable) {
+      printf("! no reply from ESP32 for %lld s: unreachable or not running\n",
+             (long long)(sinceStatus / 1000));
+      reportedUnreachable = true;
+    }
     if (now - lastPacket >= kIdleReportMs && now - lastIdle >= kIdleReportMs) {
-      printf("... no data for %lld s (%llu frames so far): ESP32 unreachable, "
-             "or no CAN traffic\n",
-             (long long)((now - lastPacket) / 1000), (unsigned long long)total);
+      if (!reportedUnreachable && espState.known)
+        printf("... no CAN frames for %lld s; ESP32 ok, CAN %s, %u frames received "
+               "since boot, %u bus errors\n",
+               (long long)((now - lastPacket) / 1000), lsu::canStateName(espState.st.canState),
+               espState.st.canRx, espState.st.busErrors);
       lastIdle = now;
     }
   }
 
-  send(sock, "LSUU", 4, 0);
+  send(sock, lsu::kMagicUnsubscribe, lsu::kUnsubscribeSize, 0);
   printf("\nunsubscribed. %llu frames, %llu lost, %llu bad packets\n",
          (unsigned long long)total, (unsigned long long)lost, (unsigned long long)bad);
   close(sock);

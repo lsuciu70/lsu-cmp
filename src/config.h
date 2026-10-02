@@ -3,6 +3,8 @@
 
 #include <stdint.h>
 
+#include "lsu_protocol.h"
+
 // --- CAN / TWAI (SPEC.md §2, §3) ---
 constexpr int kCanTxGpio = 1;  // WCMCU-230 CTX (unused: listen-only)
 constexpr int kCanRxGpio = 3;  // WCMCU-230 CRX
@@ -24,7 +26,7 @@ constexpr uint32_t kCmpInterfaceId = 0;
 // Arbitrary port, NOT an IANA-registered CMP port (none is known). Used both
 // for incoming subscriptions and as the source port of the CMP packets.
 // In Wireshark: Decode As... UDP port 12670 -> ASAM CMP.
-constexpr uint16_t kUdpPort = 12670;
+constexpr uint16_t kUdpPort = lsu::kDefaultPort;  // 12670
 
 // --- Subscription protocol (own protocol, not part of ASAM CMP) ---
 // The PC resends SUBSCRIBE every second; without one for this long the

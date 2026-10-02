@@ -1,0 +1,6 @@
+{
+  "name": "LsuProtocol",
+  "version": "0.1.0",
+  "description": "Subscription protocol between the laptop and the lsu-cmp ESP32 (not part of ASAM CMP)",
+  "platforms": "*"
+}

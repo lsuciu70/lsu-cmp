@@ -20,12 +20,14 @@ Configurația e în [src/config.h](src/config.h).
 
 ## Protocolul de abonare (propriu, nu face parte din ASAM CMP)
 
-Laptop → ESP, UDP port 12670, big-endian:
+UDP port 12670, big-endian. Definiția comună pentru firmware și clientul
+C++: [lib/LsuProtocol/src/lsu_protocol.h](lib/LsuProtocol/src/lsu_protocol.h).
 
-| Mesaj | Conținut |
-|---|---|
-| SUBSCRIBE | `"LSUS"` + uint64 ora laptopului, ns de la epoch Unix (12 octeți) |
-| UNSUBSCRIBE | `"LSUU"` (4 octeți) |
+| Mesaj | Direcție | Conținut |
+|---|---|---|
+| SUBSCRIBE | laptop → ESP | `"LSUS"` + uint64 ora laptopului, ns de la epoch Unix (12 octeți) |
+| UNSUBSCRIBE | laptop → ESP | `"LSUU"` (4 octeți) |
+| STATUS | ESP → laptop | `"LSUA"` + versiune + starea CAN și contoare (40 octeți), răspuns la fiecare SUBSCRIBE |
 
 - Ultimul expeditor al unui SUBSCRIBE devine singurul abonat.
 - Laptopul retrimite SUBSCRIBE la 1 s; după 5 s fără SUBSCRIBE abonatul expiră
@@ -35,6 +37,10 @@ Laptop → ESP, UDP port 12670, big-endian:
   ordinul latenței WiFi (câteva ms, fără compensare). Fără abonat nu se
   trimite nimic, deci toate pachetele au flag-ul `insync`.
 - Pachetele CMP pleacă de pe portul 12670 către IP:portul abonatului.
+- STATUS conține: starea controllerului CAN (running / bus-off / ...),
+  bitrate, cadre primite, pachete trimise, cadre pierdute (cozi pline,
+  overrun), erori de trimitere UDP, erori de magistrală, uptime. Clientul
+  deosebește astfel „ESP inaccesibil” de „magistrală fără trafic”.
 
 ## Formatul CMP
 
@@ -70,7 +76,9 @@ expune CRC-ul sau numărul de biți de umplere ai cadrului recepționat. Flag-ul
    ```
    Afișează fiecare cadru CAN (ora capturii, seq, `age` = cât a durat de la
    captură pe ESP până la laptop, ID, DLC, date), golurile din secvență, și
-   un mesaj la 5 s când nu vine nimic.
+   starea ESP-ului la abonare și orice schimbare (stare CAN, erori de
+   magistrală, cadre pierdute, restart), „no reply from ESP32” când nu vine
+   STATUS 3 s, și un rezumat la 5 s când nu vin cadre CAN.
 4. Validare (SPEC.md §7): Wireshark pe aceeași interfață, *Decode As…* UDP
    port 12670 → ASAM CMP.
 

@@ -4,8 +4,9 @@
 Sends SUBSCRIBE ("LSUS" + laptop time in ns since the Unix epoch) every
 second, which also keeps the ESP32 clock in sync with this machine, and
 UNSUBSCRIBE ("LSUU") on exit. Decodes the ASAM CMP data packets and reports
-gaps in sequenceCounter. Wireshark can capture the same traffic in parallel
-(Decode As... UDP port 12670 -> ASAM CMP).
+gaps in sequenceCounter. Prints the STATUS reply (ESP32 CAN state) when it
+changes. Protocol: lib/LsuProtocol/src/lsu_protocol.h. Wireshark can capture
+the same traffic in parallel (Decode As... UDP port 12670 -> ASAM CMP).
 
 Usage: tools/cmp_client.py [host] [--port 12670] [--quiet]
 """
@@ -17,6 +18,16 @@ import time
 
 SUBSCRIBE_INTERVAL_S = 1.0
 FLAG_NAMES = {0x02: "insync", 0x20: "overflow"}
+CAN_STATES = ["stopped", "running", "bus-off", "recovering"]
+
+
+def decode_status(pkt):
+    """STATUS reply to SUBSCRIBE, see lsu_protocol.h."""
+    if len(pkt) != 40 or pkt[:4] != b"LSUA" or pkt[4] != 1:
+        return None
+    state, kbps, rx, sent, qfull, senderr, buserr, missed, overrun, up = struct.unpack_from(">BHIIIIIIII", pkt, 5)
+    return {"state": CAN_STATES[state] if state < 4 else "?", "kbps": kbps, "rx": rx, "bus_err": buserr,
+            "dropped": qfull + missed + overrun, "up": up}
 
 
 def decode(pkt):
@@ -51,6 +62,7 @@ def main():
     sock.settimeout(0.1)
 
     next_sub = 0.0
+    last_status = None
     expected_seq = None
     count = lost = 0
     last_report = time.monotonic()
@@ -65,7 +77,16 @@ def main():
             except socket.timeout:
                 pkt = None
 
-            if pkt:
+            if pkt and pkt[:4] == b"LSUA":
+                st = decode_status(pkt)
+                key = st and (st["state"], st["bus_err"], st["dropped"])
+                if st is None:
+                    print("? unknown STATUS")
+                elif last_status is None or key != last_status:
+                    print(f"status: CAN {st['state']} at {st['kbps']} kbit/s, {st['rx']} frames received, "
+                          f"{st['bus_err']} bus errors, {st['dropped']} dropped, up {st['up']}s")
+                    last_status = key
+            elif pkt:
                 f = decode(pkt)
                 if f is None or not f["ok"]:
                     print(f"? unexpected packet ({len(pkt)} bytes)")
