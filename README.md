@@ -134,3 +134,9 @@ CMake builds the reusable part as the static library `cmp_subscriber`
 uses the same sources and writes its own `main`.
 
 Host tests (encoder, decoder, protocol): `pio test -e native`.
+
+## Credits
+
+Firmware, test client and documentation were developed together with
+[Claude Code](https://claude.com/claude-code) (Claude Opus 5.5 by Anthropic).
+Commits made this way carry a `Co-Authored-By: Claude` trailer.
