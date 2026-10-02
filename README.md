@@ -49,7 +49,7 @@ payload CAN), conform SPEC.md §4, cu o precizare față de SPEC: masca
 `0xFFFFFF1F` din biblioteca openDAQ se aplică pe cuvântul brut citit pe un
 host little-endian. Pe fir (big-endian) câmpul `id` are ID-ul în biții
 0–28, `rsvd` = bit 29, `RTR` = bit 30, `IDE` = bit 31. Encoderul
-([lib/CmpEncoder](lib/CmpEncoder/src/cmp_encoder.h)) a fost verificat octet
+([lib/CmpCodec](lib/CmpCodec/src/cmp_encoder.h)) a fost verificat octet
 cu octet față de pachete construite cu openDAQ/ASAM-CMP-Library.
 
 Câmpul `crc` e 0, cu `crcSupport`/`sbcSupport` = 0 (nesuportat): TWAI nu
@@ -66,15 +66,13 @@ expune CRC-ul sau numărul de biți de umplere ai cadrului recepționat. Flag-ul
    192.168.100.240). Unde nu e nicio rețea salvată în raza, pornește AP-ul
    `lsu-cmp`. Laptopul se conectează la el; din `http://10.10.10.10` se pot
    adăuga rețele externe (vezi [README-WIFI.md](README-WIFI.md)).
-3. Pe laptop: `tools/cmp_client.py` (implicit `10.10.10.10`), sau
-   `tools/cmp_client.py <IP>` în modul station. `--quiet` afișează doar
-   cadre/s și pierderile.
-   Client C++ (Linux), cu aceleași opțiuni:
+3. Pe laptop, clientul de test C++ (Linux):
    ```
    cmake -S tools/cmp_client -B tools/cmp_client/build && cmake --build tools/cmp_client/build
    tools/cmp_client/build/cmp_client 192.168.100.240
    ```
-   Afișează fiecare cadru CAN (ora capturii, seq, `age` = cât a durat de la
+   Fără IP folosește `10.10.10.10` (modul AP); `--quiet` afișează doar
+   cadre/s, pierderile și starea CAN. Afișează fiecare cadru CAN (ora capturii, seq, `age` = cât a durat de la
    captură pe ESP până la laptop, ID, DLC, date), golurile din secvență, și
    starea ESP-ului la abonare și orice schimbare (stare CAN, erori de
    magistrală, cadre pierdute, restart), „no reply from ESP32” când nu vine
@@ -90,4 +88,19 @@ odată, fără parolă. Mesajele interne LsuWifi apar doar pe USB. Logul afișea
 erori de trimitere și contoarele TWAI (`bus_err`). Dacă `bus_err` crește
 mult, încearcă 250 kbit/s: `build_flags = -DCAN_BITRATE_KBPS=250`.
 
-Teste encoder pe host: `pio test -e native`.
+## Clientul de test și baza pentru clienți ulteriori
+
+[tools/cmp_client/](tools/cmp_client/) (C++17, Linux, CMake):
+
+| Fișier | Rol |
+|---|---|
+| [cmp_subscriber.h](tools/cmp_client/cmp_subscriber.h) / `.cpp` | Partea refolosibilă: socket, SUBSCRIBE periodic, STATUS, numărare secvență, detectare ESP inaccesibil. Fără output, fără thread-uri; evenimente prin callback-uri (`onFrame`, `onGap`, `onStatus`, `onUnreachable`, `onReachable`, `onUnknownPacket`). |
+| [main.cpp](tools/cmp_client/main.cpp) | Clientul de test: linia de comandă și afișarea callback-urilor. |
+| [lib/CmpCodec](lib/CmpCodec/src/) | Encoder (firmware) și decoder (client) CMP, comune. |
+| [lib/LsuProtocol](lib/LsuProtocol/src/lsu_protocol.h) | Protocolul de abonare, comun. |
+
+CMake construiește partea refolosibilă ca bibliotecă statică
+`cmp_subscriber` (CmpSubscriber + decoder), cu care se leagă `cmp_client`.
+Un client nou folosește aceleași surse și își scrie propriul `main`.
+
+Teste pe host (encoder, decoder, protocol): `pio test -e native`.

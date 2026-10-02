@@ -1,0 +1,6 @@
+{
+  "name": "CmpCodec",
+  "version": "0.1.0",
+  "description": "ASAM CMP encoder and decoder for classic CAN data messages",
+  "platforms": "*"
+}
