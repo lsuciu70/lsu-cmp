@@ -4,7 +4,7 @@
 
 Firmware for the ESP32-C3 that passively reads the CAN bus on a vehicle's OBD2 connector (through the internal TWAI controller), wraps every received CAN frame in the ASAM CMP (Capture Module Protocol) format, and sends the packets over UDP and WiFi to a data sink (PC) on the local network.
 
-We transmit nothing on the CAN bus, we only listen (listen-only).
+We transmit no frames on the CAN bus. By default the controller ACKs received frames (TWAI normal mode, see §3); listen-only remains available.
 
 ## 2. Hardware (confirmed, wired)
 
@@ -29,7 +29,7 @@ Target vehicle: VW Golf 7, 2017, 1.6 TDI (MQB platform, Gateway J533). OBD2 pins
 
 ## 3. TWAI configuration (ESP32-C3 internal CAN driver)
 
-- **Mode: listen-only** (`TWAI_MODE_LISTEN_ONLY` in ESP-IDF). Mandatory: we never send ACKs or error frames on the live bus of a real vehicle.
+- **Mode: normal, receive only** (`TWAI_MODE_NORMAL` in ESP-IDF, build flag `CAN_ACK=1`, the default). The firmware never queues a frame for transmission, but the controller ACKs every valid frame and sends error frames on errors. Originally listen-only (`TWAI_MODE_LISTEN_ONLY`, now `CAN_ACK=0`) was mandatory; the first in-car test (2026-10-17) showed why that is not enough on the Golf 7 OBD2 bus: with ignition on, one node sends ID `0x17F00010` (extended, data `20 10 00 00 00 00 00 00`), nobody ACKs it, so it is retransmitted back to back at 100% bus load. A listen-only node only ever sees that retransmission. With ACKs (second test, same day) the same frame comes once every ~500 ms and nothing else is on the bus, engine running or not. Normal mode is only safe at the correct bitrate: a wrong one makes this node send error frames on the live bus.
 - **Baud rate: 500 kbit/s** as the first test (ISO 15765-4 standard for most post-2008 diagnostic buses). If massive bit/frame errors show up, try 250 kbit/s.
 - Classic CAN only (2.0A/B), no CAN-FD: neither the transceiver (SN65HVD230) nor the ESP32-C3 TWAI supports CAN-FD.
 - We accept both 11-bit and 29-bit IDs (open filter, no masking on reception, at least during the initial test/traffic exploration phase).
@@ -98,7 +98,7 @@ offset  size  field
 
 ## 5. Proposed firmware architecture
 
-1. **TWAI capture task**: TWAI driver initialized in listen-only mode, reads frames from the receive queue (blocking or with a short timeout), puts them into an internal FreeRTOS queue.
+1. **TWAI capture task**: TWAI driver initialized in receive-only mode (§3), reads frames from the receive queue (blocking or with a short timeout), puts them into an internal FreeRTOS queue.
 2. **Encode + send task**: takes frames from the queue, builds the CMP packet (CmpHeader + MessageHeader + CAN payload) as in §4, increments `sequenceCounter`, sends it through a UDP socket.
 3. No need for large buffering: one CAN frame = one UDP packet, sent as soon as it is available (we do not aggregate several frames into one UDP packet, following the reference library's model where one CMP "frame" = one message).
 
@@ -119,4 +119,4 @@ Wireshark has an official `asam-cmp` dissector: use it to confirm that the packe
 
 - The exact format of the CMP **Status/Control** messages (device discovery on the network): not verified, not needed for a simple data sender.
 - The exact computation of the CAN CRC for the payload's `crc` field: the ESP32 TWAI might not expose this value raw; to be checked during implementation and, if not available, explicitly documented in the code that 0/unsupported is sent, not an invented value.
-- 100% confirmation that the bus on pins 6/14 of the Golf 7 runs at 500 kbit/s (very likely, but not yet verified with a real capture).
+- ~~100% confirmation that the bus on pins 6/14 of the Golf 7 runs at 500 kbit/s~~ Confirmed by the in-car test of 2026-10-17: ~300,000 frames at 500 kbit/s, 0 bus errors while the bus was active.

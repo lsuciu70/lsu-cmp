@@ -6,8 +6,18 @@
 #include "lsu_protocol.h"
 
 // --- CAN / TWAI (SPEC.md §2, §3) ---
-constexpr int kCanTxGpio = 1;  // WCMCU-230 CTX (unused: listen-only)
+constexpr int kCanTxGpio = 1;  // WCMCU-230 CTX (ACK bits only, see CAN_ACK)
 constexpr int kCanRxGpio = 3;  // WCMCU-230 CRX
+// 1: TWAI normal mode. The firmware never queues a frame for transmission,
+//    but the controller ACKs every valid frame and sends error frames.
+//    Needed on the Golf 7 OBD2 bus: without any ACKing node the sender
+//    retransmits the same frame back to back (in-car test, 2026-10-17).
+// 0: listen-only, the node never drives the bus.
+// Normal mode is only safe with the right bitrate: a wrong one makes this
+// node send error frames on the live bus.
+#ifndef CAN_ACK
+#define CAN_ACK 1
+#endif
 // 500 kbit/s first (ISO 15765-4). If the stats log shows many bus errors,
 // try 250.
 #ifndef CAN_BITRATE_KBPS

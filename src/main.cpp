@@ -1,7 +1,8 @@
 // ESP32-C3 CAN -> ASAM CMP UDP sender (SPEC.md).
 //
 // Tasks:
-//   capture  - TWAI in listen-only mode, timestamps frames, queues them
+//   capture  - TWAI receive only (ACKs unless CAN_ACK=0, config.h),
+//              timestamps frames, queues them
 //              while a subscriber is active (SPEC.md §5.1)
 //   sender   - one CMP packet per CAN frame, UDP to the subscriber (§5.2)
 //   control  - receives SUBSCRIBE / UNSUBSCRIBE on the UDP port, replies
@@ -80,7 +81,8 @@ bool sameAddr(const sockaddr_in& a, const sockaddr_in& b) {
 
 void startTwai() {
   twai_general_config_t g = TWAI_GENERAL_CONFIG_DEFAULT(
-      (gpio_num_t)kCanTxGpio, (gpio_num_t)kCanRxGpio, TWAI_MODE_LISTEN_ONLY);
+      (gpio_num_t)kCanTxGpio, (gpio_num_t)kCanRxGpio,
+      CAN_ACK ? TWAI_MODE_NORMAL : TWAI_MODE_LISTEN_ONLY);
   g.rx_queue_len = kTwaiRxQueueLen;
 #if CAN_BITRATE_KBPS == 500
   twai_timing_config_t t = TWAI_TIMING_CONFIG_500KBITS();
@@ -98,7 +100,8 @@ void startTwai() {
     netLog.printf("[can] TWAI start failed: %s\n", esp_err_to_name(err));
     return;
   }
-  netLog.printf("[can] TWAI listen-only, %d kbit/s, RX GPIO%d\n",
+  netLog.printf("[can] TWAI %s, %d kbit/s, RX GPIO%d\n",
+                CAN_ACK ? "normal (ACK, no transmit)" : "listen-only",
                 CAN_BITRATE_KBPS, kCanRxGpio);
 }
 
@@ -279,7 +282,7 @@ void setup() {
   Serial.begin(115200);
   netLog.printf("[boot] lsu-cmp, reset reason %d\n", (int)esp_reset_reason());
   frameQueue = xQueueCreate(kFrameQueueLen, sizeof(QueuedFrame));
-  startTwai();  // listen-only: never drives the bus, safe before WiFi
+  startTwai();  // never transmits frames (at most ACK bits), safe before WiFi
 
   LsuWifi.begin();  // blocks until connected or the AP is up
   netLog.printf("[net] %s, IP %s, UDP port %u\n",

@@ -1,8 +1,8 @@
 # lsu-cmp
 
-ESP32-C3 firmware that passively listens (listen-only) to the CAN bus on the
-OBD2 connector and sends every frame, wrapped in ASAM CMP, over UDP and WiFi
-to a laptop. Full specification: [SPEC.md](SPEC.md).
+ESP32-C3 firmware that listens to the CAN bus on the OBD2 connector (it
+transmits no frames, only ACKs; see `CAN_ACK` below) and sends every frame,
+wrapped in ASAM CMP, over UDP and WiFi to a laptop. Full specification: [SPEC.md](SPEC.md).
 
 ## Hardware
 
@@ -15,8 +15,8 @@ to a laptop. Full specification: [SPEC.md](SPEC.md).
 - No 120 Ω termination on this node (the vehicle bus is already terminated).
 
 Pin-by-pin wiring: [SPEC.md §2](SPEC.md#2-hardware-confirmed-wired). The
-CAN GPIOs are in [src/config.h](src/config.h): TX = GPIO1 (CTX, unused in
-listen-only mode), RX = GPIO3 (CRX).
+CAN GPIOs are in [src/config.h](src/config.h): TX = GPIO1 (CTX, carries
+only ACK bits and error frames), RX = GPIO3 (CRX).
 
 Things to keep in mind (not yet measured or verified):
 
@@ -24,18 +24,26 @@ Things to keep in mind (not yet measured or verified):
   stays powered with WiFi on, estimated at 30–50 mA from the 12 V battery,
   about 1 Ah per day. Fine for days, not for weeks: unplug it, or add a
   low-power mode for when the bus is silent, if it stays installed.
-- **The MQB gateway (J533) most likely does not forward the car's normal
-  traffic to OBD2 pins 6/14.** The diagnostic bus usually carries only
-  tester requests and responses, so in listen-only mode there may be little
-  or no traffic unless a tester (VCDS, OBD Eleven, ...) is active at the same
-  time. If the client shows 0 frames with STATUS `CAN running` and 0 bus
-  errors, this is the likely cause, not wiring or bitrate.
+- **The MQB gateway (J533) does not forward the car's normal traffic to
+  OBD2 pins 6/14.** First in-car test (2026-10-17, Golf 7, listen-only):
+  wiring, supply and 500 kbit/s confirmed, but with ignition on the only
+  traffic was ID `0x17F00010` (`20 10 00 00 00 00 00 00`) repeated back to
+  back at 100% bus load: no node ACKed it, so its sender retransmitted it
+  endlessly. Hence the default `CAN_ACK=1` (TWAI normal mode: ACKs, never
+  transmits a frame). `-DCAN_ACK=0` goes back to listen-only, which on this
+  bus only makes sense with a tester (VCDS, OBD Eleven, ...) connected at
+  the same time to provide the ACKs. With ignition off the bus is silent.
+  Second test (same day, `CAN_ACK=1`): the same frame arrives once every
+  ~500 ms, from ignition on until ~20 s after ignition (or engine) off, with
+  0 losses and 0 bus errors, and nothing else, engine running or not. The
+  OBD2 bus carries no vehicle data unless a tester requests it.
 
 ## Decisions (SPEC.md §6)
 
 | Decision | Choice |
 |---|---|
 | Toolchain | PlatformIO, Arduino framework; TWAI through ESP-IDF's `driver/twai.h` |
+| TWAI mode | normal, receive only (`CAN_ACK=1`): ACKs frames, never transmits one; `CAN_ACK=0` = listen-only |
 | deviceId / streamId | 1 / 1, chosen locally, **not** from an official ASAM registry |
 | UDP port | 12670, arbitrary, **not** an IANA-registered port for CMP |
 | Destination | subscription model: the laptop subscribes to the ESP32, which sends unicast to the subscriber |
