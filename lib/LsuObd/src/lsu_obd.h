@@ -26,8 +26,9 @@ constexpr uint8_t kPositiveResponse = 0x40;  // added to the mode
 constexpr uint8_t kNegativeResponse = 0x7F;
 
 // ISO 15765-4 requires DLC 8; the value of unused bytes is not specified
-// and receivers ignore it. 0x55 chosen here, not taken from any VW source.
-constexpr uint8_t kPadding = 0x55;
+// and receivers ignore it. 0xAA: what the Golf 7 engine ECU pads its own
+// answers with (in-car test, 2026-10-17), not taken from any VW document.
+constexpr uint8_t kPadding = 0xAA;
 
 // ISO-TP protocol control information, high nibble of byte 0.
 constexpr uint8_t kPciSingle = 0x0;

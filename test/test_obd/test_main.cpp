@@ -17,7 +17,7 @@ void test_whitelist() {
 void test_request_frame() {
   uint8_t data[8];
   obd::buildRequest(0x01, 0x0C, data);
-  const uint8_t expected[] = {0x02, 0x01, 0x0C, 0x55, 0x55, 0x55, 0x55, 0x55};
+  const uint8_t expected[] = {0x02, 0x01, 0x0C, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA};
   TEST_ASSERT_EQUAL_HEX8_ARRAY(expected, data, 8);
 }
 
@@ -37,7 +37,7 @@ void test_first_frame() {
   TEST_ASSERT_FALSE(obd::isFirstFrame(0x7DF, false, 8, ff));  // not a response
   TEST_ASSERT_FALSE(obd::isFirstFrame(0x7E8, true, 8, ff));
   TEST_ASSERT_FALSE(obd::isFirstFrame(0x7E8, false, 1, ff));
-  const uint8_t sf[] = {0x04, 0x41, 0x0C, 0x0C, 0x80, 0x55, 0x55, 0x55};
+  const uint8_t sf[] = {0x04, 0x41, 0x0C, 0x0C, 0x80, 0xAA, 0xAA, 0xAA};
   TEST_ASSERT_FALSE(obd::isFirstFrame(0x7E8, false, 8, sf));
   const uint8_t cf[] = {0x21, 'W', 'Z', 'Z', 'Z', 'A', 'U', 'Z'};
   TEST_ASSERT_FALSE(obd::isFirstFrame(0x7E8, false, 8, cf));
@@ -48,7 +48,7 @@ void test_flow_control() {
   TEST_ASSERT_EQUAL_HEX32(0x7E7, obd::flowControlId(0x7EF));
   uint8_t data[8];
   obd::buildFlowControl(data);
-  const uint8_t expected[] = {0x30, 0x00, 0x00, 0x55, 0x55, 0x55, 0x55, 0x55};
+  const uint8_t expected[] = {0x30, 0x00, 0x00, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA};
   TEST_ASSERT_EQUAL_HEX8_ARRAY(expected, data, 8);
 }
 

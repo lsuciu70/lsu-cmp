@@ -92,7 +92,8 @@ C++ client: [lib/LsuProtocol/src/lsu_protocol.h](lib/LsuProtocol/src/lsu_protoco
   50 ms, and only when built with `CAN_ACK=1`. Anything else is refused
   with a REQUEST_RESULT saying why; nothing goes on the bus.
 - It sends the request as a single frame on `0x7DF` (functional, all
-  emission ECUs): `02 <mode> <PID>`, padded to 8 bytes with `0x55`.
+  emission ECUs): `02 <mode> <PID>`, padded to 8 bytes with `0xAA`, as the
+  engine ECU pads its answers.
 - ECUs answer on `0x7E8`..`0x7EF`. For a multi-frame answer (e.g. the VIN)
   the ESP32 sends the ISO-TP flow control to `0x7E0`..`0x7E7` itself, but
   only within 1 s of its own request, so it never answers for another
