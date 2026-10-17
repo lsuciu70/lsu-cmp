@@ -30,11 +30,17 @@ constexpr uint8_t kFlagInsync = 0x02;
 constexpr uint8_t kFlagOverflow = 0x20;
 constexpr uint8_t kFlagErrorInPayload = 0x40;
 
-// CAN payload `id` field, as a big-endian 32-bit value on the wire. The
-// library writes these masks on the raw (byte-swapped) word of a
-// little-endian host: idMask 0xFFFFFF1F, rsvd 0x20, rtr 0x40, ide 0x80.
-// Translated to wire order: ID in bits 0..28, then rsvd, RTR/RRS, IDE.
+// CAN payload `id` field, as a big-endian 32-bit value on the wire: the
+// identifier in bits 0..28, then rsvd (Wireshark: ERR), RTR/RRS, IDE.
+// A 29-bit ID fills bits 0..28. An 11-bit ID sits in bits 18..28, where
+// the base ID of an extended frame is, as Wireshark (4.6) decodes it by
+// default. openDAQ/ASAM-CMP-Library puts it in bits 0..10 instead, which
+// Wireshark calls "the old encoding"; this firmware did too until
+// 2026-10-17. The decoder reads both (SPEC.md §4.3).
 constexpr uint32_t kIdMask = 0x1FFFFFFF;
+constexpr uint32_t kId11Shift = 18;
+constexpr uint32_t kId11Mask = 0x7FFu << kId11Shift;
+constexpr uint32_t kId11MaskOld = 0x7FF;
 constexpr uint32_t kIdRsvd = 1u << 29;
 constexpr uint32_t kIdRtr = 1u << 30;
 constexpr uint32_t kIdIde = 1u << 31;

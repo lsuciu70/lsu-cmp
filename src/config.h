@@ -34,10 +34,12 @@ constexpr uint8_t kCmpStreamId = 1;
 constexpr uint32_t kCmpInterfaceId = 0;
 
 // --- UDP ---
-// Arbitrary port, NOT an IANA-registered CMP port (none is known). Used both
-// for incoming subscriptions and as the source port of the CMP packets.
-// In Wireshark: Decode As... UDP port 12670 -> ASAM CMP.
-constexpr uint16_t kUdpPort = lsu::kDefaultPort;  // 12670
+// Arbitrary ports, NOT IANA-registered (none is known for CMP). The data
+// port is only the source port of the CMP packets; in Wireshark: Decode
+// As... UDP port 12670 -> ASAM CMP. The control port carries the own
+// protocol (lsu_protocol.h).
+constexpr uint16_t kDataPort = lsu::kDataPort;        // 12670
+constexpr uint16_t kControlPort = lsu::kControlPort;  // 12671
 
 // --- Subscription protocol (own protocol, not part of ASAM CMP) ---
 // The PC resends SUBSCRIBE every second; without one for this long the

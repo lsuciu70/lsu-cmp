@@ -1,5 +1,6 @@
 // Golden-byte tests for the CMP encoder (the expected bytes were also
-// checked against packets built with openDAQ/ASAM-CMP-Library), and
+// checked against packets built with openDAQ/ASAM-CMP-Library, except the
+// 11-bit ID position, see cmp_encoder.h), and
 // encode -> decode round trips for the decoder.
 #include <cmp_decoder.h>
 #include <cmp_encoder.h>
@@ -24,7 +25,7 @@ void test_standard_frame() {
       0x02, 0x01, 0x00, 0x18,                          // flags, type, length 24
       // CAN payload
       0x00, 0x00, 0x00, 0x00,                          // flags, reserved
-      0x00, 0x00, 0x07, 0xE8,                          // id
+      0x1F, 0xA0, 0x00, 0x00,                          // id 0x7E8 << 18
       0x00, 0x00, 0x00, 0x00,                          // crc
       0x00, 0x00, 0x08, 0x08,                          // errorPos, dlc, len
       0x10, 0x14, 0x49, 0x02, 0x01, 0x57, 0x56, 0x57};
@@ -84,6 +85,19 @@ void test_decode_round_trip() {
   assertRoundTrip({0x123, false, false, 15, {1, 2, 3, 4, 5, 6, 7, 8}}, 8);
 }
 
+// Recordings made before 2026-10-17 carry 11-bit IDs in bits 0..10.
+void test_decode_old_11bit_encoding() {
+  cmp::CanFrame f = {0x7E8, false, false, 8, {1, 2, 3, 4, 5, 6, 7, 8}};
+  uint8_t buf[cmp::kMaxPacketSize];
+  size_t n = cmp::encodeCanPacket(kStream, 0, 0, 0, f, buf);
+  const uint8_t oldId[] = {0x00, 0x00, 0x07, 0xE8};
+  memcpy(buf + 28, oldId, 4);
+  cmp::DecodedCanPacket d;
+  TEST_ASSERT_TRUE(cmp::decodeCanPacket(buf, n, d));
+  TEST_ASSERT_EQUAL_HEX32(0x7E8, d.frame.id);
+  TEST_ASSERT_FALSE(d.frame.extended);
+}
+
 void test_decode_rejects_invalid() {
   cmp::CanFrame f = {0x7E8, false, false, 8, {1, 2, 3, 4, 5, 6, 7, 8}};
   uint8_t good[cmp::kMaxPacketSize];
@@ -126,6 +140,7 @@ int main() {
   RUN_TEST(test_extended_rtr_frame);
   RUN_TEST(test_dlc_above_8_clamps_data);
   RUN_TEST(test_decode_round_trip);
+  RUN_TEST(test_decode_old_11bit_encoding);
   RUN_TEST(test_decode_rejects_invalid);
   return UNITY_END();
 }

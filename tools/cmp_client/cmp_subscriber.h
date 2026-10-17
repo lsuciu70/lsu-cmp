@@ -4,7 +4,7 @@
 //
 // Typical use:
 //   CmpSubscriber sub(callbacks);
-//   if (!sub.open("192.168.100.240", lsu::kDefaultPort, &err)) ...
+//   if (!sub.open("192.168.100.240", lsu::kControlPort, &err)) ...
 //   while (running) sub.poll(100);
 //   sub.sendRequest(0x01, 0x0C);  // optional: OBD2 request, see below
 //   sub.close();  // sends UNSUBSCRIBE (also done by the destructor)
@@ -26,9 +26,10 @@
 class CmpSubscriber {
  public:
   struct Callbacks {
-    // Every datagram from the ESP32 as received, before the callbacks
-    // below (for recording, see pcap_file.h).
-    std::function<void(const uint8_t* data, size_t size)> onPacket;
+    // Every datagram from the ESP32 as received, with the port it came
+    // from (data or control), before the callbacks below (for recording,
+    // see pcap_file.h).
+    std::function<void(const uint8_t* data, size_t size, uint16_t srcPort)> onPacket;
     // One CAN frame (one CMP packet), in arrival order.
     std::function<void(const cmp::DecodedCanPacket&)> onFrame;
     // sequenceCounter jumped: `lost` packets were not received.
@@ -62,9 +63,10 @@ class CmpSubscriber {
   CmpSubscriber(const CmpSubscriber&) = delete;
   CmpSubscriber& operator=(const CmpSubscriber&) = delete;
 
-  // Resolves host and opens the socket. SUBSCRIBE goes out on the first
-  // poll(). On failure returns false and sets *error if given.
-  bool open(const std::string& host, uint16_t port, std::string* error = nullptr);
+  // Resolves host and opens the socket. SUBSCRIBE goes out to the ESP32's
+  // control port on the first poll(); CMP packets are accepted from any
+  // port of that host. On failure returns false and sets *error if given.
+  bool open(const std::string& host, uint16_t controlPort, std::string* error = nullptr);
   bool poll(int timeoutMs);  // false if not open
   void close();              // sends UNSUBSCRIBE, closes the socket
   // Asks the ESP32 to put one OBD2 request (lsu_obd.h) on the bus. The
@@ -72,10 +74,9 @@ class CmpSubscriber {
   // CAN frames in onFrame. False if not open or the send failed.
   bool sendRequest(uint8_t mode, uint8_t pid);
 
-  // IPv4 addresses (host byte order) and ports of this socket and of the
-  // ESP32. False if not open.
-  bool endpoints(uint32_t& localIp, uint16_t& localPort, uint32_t& peerIp,
-                 uint16_t& peerPort) const;
+  // IPv4 address (host byte order) and port this socket receives on, and
+  // the ESP32's address. False if not open.
+  bool addresses(uint32_t& localIp, uint16_t& localPort, uint32_t& espIp) const;
 
   int fd() const { return _sock; }
   bool reachable() const { return _reachable; }
@@ -84,14 +85,17 @@ class CmpSubscriber {
   const Counters& counters() const { return _counters; }
 
  private:
+  bool sendToEsp(const uint8_t* data, size_t size);
   void sendSubscribe(int64_t nowMs);
   void receive();
-  void handlePacket(const uint8_t* data, size_t size);
+  void handlePacket(const uint8_t* data, size_t size, uint16_t srcPort);
   void checkTimeout(int64_t nowMs);
 
   Callbacks _cb;
   Options _opt;
   int _sock = -1;
+  uint32_t _espIp = 0;  // network byte order
+  uint16_t _controlPort = 0;  // network byte order
   int64_t _nextSubscribeMs = 0;
   int64_t _lastStatusMs = 0;  // or open() time, before the first STATUS
   bool _reachable = true;     // until statusTimeoutMs passes without STATUS

@@ -12,8 +12,11 @@
 // counter keeps counting up across passes, and after the first pass the
 // last STATUS stays, so the client sees neither gaps nor a restart.
 //
-// Usage: cmp_replay FILE.pcap [--bind 127.0.0.1] [--port 12670] [--speed X] [--loop]
-//                   [--keep-time]
+// Like the firmware it uses two ports (lsu_protocol.h): CMP goes out from
+// the data port, the own protocol runs on the control port.
+//
+// Usage: cmp_replay FILE.pcap [--bind 127.0.0.1] [--data-port 12670]
+//                   [--control-port 12671] [--speed X] [--loop] [--keep-time]
 
 #include <arpa/inet.h>
 #include <poll.h>
@@ -77,17 +80,34 @@ bool sameAddr(const sockaddr_in& a, const sockaddr_in& b) {
 
 void usage(const char* prog) {
   fprintf(stderr,
-          "Usage: %s FILE.pcap [--bind ADDR] [--port N] [--speed X] [--loop] [--keep-time]\n"
-          "  --bind       address to listen on (default 127.0.0.1)\n"
-          "  --port       UDP port (default %u)\n"
+          "Usage: %s FILE.pcap [--bind ADDR] [--data-port N] [--control-port N]\n"
+          "       [--speed X] [--loop] [--keep-time]\n"
+          "  --bind          address to listen on (default 127.0.0.1)\n"
+          "  --data-port     UDP port CMP is sent from (default %u)\n"
+          "  --control-port  UDP port for SUBSCRIBE etc. (default %u)\n"
           "  --speed      playback speed factor (default 1)\n"
           "  --loop       start again at the end\n"
           "  --keep-time  send the recorded CMP timestamps unchanged\n",
-          prog, lsu::kDefaultPort);
+          prog, lsu::kDataPort, lsu::kControlPort);
 }
 
-// The CMP packets and STATUS messages the ESP32 sent in the recording.
-bool loadRecording(const std::string& path, uint16_t port, std::vector<Event>& events) {
+int openSocket(in_addr ip, uint16_t port) {
+  int s = socket(AF_INET, SOCK_DGRAM, 0);
+  sockaddr_in local{};
+  local.sin_family = AF_INET;
+  local.sin_addr = ip;
+  local.sin_port = htons(port);
+  if (s >= 0 && bind(s, (sockaddr*)&local, sizeof(local)) < 0) {
+    close(s);
+    return -1;
+  }
+  return s;
+}
+
+// The CMP packets and STATUS messages the ESP32 sent in the recording,
+// from either of its ports (before 2026-10-17 both came from the data port).
+bool loadRecording(const std::string& path, uint16_t dataPort, uint16_t controlPort,
+                   std::vector<Event>& events) {
   PcapReader reader;
   std::string error;
   if (!reader.open(path, &error)) {
@@ -97,7 +117,7 @@ bool loadRecording(const std::string& path, uint16_t port, std::vector<Event>& e
   UdpRecord r;
   uint64_t first = 0;
   while (reader.next(r)) {
-    if (r.srcPort != port) continue;  // laptop -> ESP32, or other traffic
+    if (r.srcPort != dataPort && r.srcPort != controlPort) continue;  // laptop -> ESP32
     bool isStatus = lsu::isStatus(r.payload.data(), r.payload.size());
     cmp::DecodedCanPacket pkt;
     if (!isStatus && !cmp::decodeCanPacket(r.payload.data(), r.payload.size(), pkt))
@@ -114,15 +134,17 @@ bool loadRecording(const std::string& path, uint16_t port, std::vector<Event>& e
 
 int main(int argc, char** argv) {
   std::string path, bindAddr = "127.0.0.1";
-  uint16_t port = lsu::kDefaultPort;
+  uint16_t dataPort = lsu::kDataPort, controlPort = lsu::kControlPort;
   double speed = 1;
   bool loop = false, keepTime = false;
   for (int i = 1; i < argc; i++) {
     std::string a = argv[i];
     if (a == "--bind" && i + 1 < argc) {
       bindAddr = argv[++i];
-    } else if (a == "--port" && i + 1 < argc) {
-      port = uint16_t(std::stoi(argv[++i]));
+    } else if (a == "--data-port" && i + 1 < argc) {
+      dataPort = uint16_t(std::stoi(argv[++i]));
+    } else if (a == "--control-port" && i + 1 < argc) {
+      controlPort = uint16_t(std::stoi(argv[++i]));
     } else if (a == "--speed" && i + 1 < argc) {
       speed = std::stod(argv[++i]);
     } else if (a == "--loop") {
@@ -145,11 +167,12 @@ int main(int argc, char** argv) {
   }
 
   std::vector<Event> events;
-  if (!loadRecording(path, port, events)) return 1;
+  if (!loadRecording(path, dataPort, controlPort, events)) return 1;
   size_t frames = 0, statuses = 0;
   for (const Event& e : events) (e.isStatus ? statuses : frames)++;
   if (frames == 0) {
-    fprintf(stderr, "%s: no CMP packets from port %u\n", path.c_str(), port);
+    fprintf(stderr, "%s: no CMP packets from port %u or %u\n", path.c_str(), dataPort,
+            controlPort);
     return 1;
   }
   double durationS = events.back().atNs / 1e9;
@@ -167,22 +190,23 @@ int main(int argc, char** argv) {
   setvbuf(stdout, nullptr, _IOLBF, 0);
   printf("%s: %zu CMP packets, %zu STATUS, %.1f s\n", path.c_str(), frames, statuses, durationS);
 
-  int sock = socket(AF_INET, SOCK_DGRAM, 0);
-  sockaddr_in local{};
-  local.sin_family = AF_INET;
-  local.sin_port = htons(port);
-  if (inet_pton(AF_INET, bindAddr.c_str(), &local.sin_addr) != 1) {
+  in_addr bindIp{};
+  if (inet_pton(AF_INET, bindAddr.c_str(), &bindIp) != 1) {
     fprintf(stderr, "bad address %s\n", bindAddr.c_str());
     return 2;
   }
-  if (sock < 0 || bind(sock, (sockaddr*)&local, sizeof(local)) < 0) {
-    fprintf(stderr, "cannot listen on %s:%u: %s\n", bindAddr.c_str(), port, strerror(errno));
+  int dataSock = openSocket(bindIp, dataPort);
+  int controlSock = openSocket(bindIp, controlPort);
+  if (dataSock < 0 || controlSock < 0) {
+    fprintf(stderr, "cannot listen on %s:%u/%u: %s\n", bindAddr.c_str(), dataPort, controlPort,
+            strerror(errno));
     return 1;
   }
   std::signal(SIGINT, onSignal);
   std::signal(SIGTERM, onSignal);
-  printf("playing as ESP32 on %s:%u, speed %g%s (Ctrl+C to stop); waiting for a subscriber\n",
-         bindAddr.c_str(), port, speed, loop ? ", loop" : "");
+  printf("playing as ESP32 on %s, data port %u, control port %u, speed %g%s (Ctrl+C to stop);\n"
+         "waiting for a subscriber\n",
+         bindAddr.c_str(), dataPort, controlPort, speed, loop ? ", loop" : "");
 
   // Recording time played so far; advances only while subscribed.
   double playNs = 0;
@@ -226,7 +250,7 @@ int main(int argc, char** argv) {
           int64_t age = int64_t(e.arrivalNs - get64be(&pkt[kCmpTimestampOffset]));
           put64be(&pkt[kCmpTimestampOffset], unixNs() - age);
         }
-        sendto(sock, pkt.data(), pkt.size(), 0, (sockaddr*)&subscriber, sizeof(subscriber));
+        sendto(dataSock, pkt.data(), pkt.size(), 0, (sockaddr*)&subscriber, sizeof(subscriber));
         sent++;
       }
       next++;
@@ -252,7 +276,7 @@ int main(int argc, char** argv) {
       double dueInMs = (double(events[next].atNs) - playNs) / speed / 1e6;
       waitMs = int(std::ceil(std::max(0.0, std::min(dueInMs, 100.0))));
     }
-    pollfd pfd = {sock, POLLIN, 0};
+    pollfd pfd = {controlSock, POLLIN, 0};
     if (::poll(&pfd, 1, waitMs) <= 0) {
       if (active && monoNs() - lastSubscribeNs > kSubscriberTimeoutMs * 1000000) {
         active = false;
@@ -264,7 +288,7 @@ int main(int argc, char** argv) {
     uint8_t buf[64];
     sockaddr_in from{};
     socklen_t fromLen = sizeof(from);
-    ssize_t n = recvfrom(sock, buf, sizeof(buf), 0, (sockaddr*)&from, &fromLen);
+    ssize_t n = recvfrom(controlSock, buf, sizeof(buf), 0, (sockaddr*)&from, &fromLen);
     if (n <= 0) continue;
     uint64_t laptopNs;
     uint8_t mode, pid;
@@ -277,7 +301,7 @@ int main(int argc, char** argv) {
       subscriber = from;
       lastSubscribeNs = monoNs();
       if (const std::vector<uint8_t>* st = statusToSend())
-        sendto(sock, st->data(), st->size(), 0, (sockaddr*)&from, sizeof(from));
+        sendto(controlSock, st->data(), st->size(), 0, (sockaddr*)&from, sizeof(from));
     } else if (lsu::isUnsubscribe(buf, size_t(n))) {
       if (active && sameAddr(subscriber, from)) {
         active = false;
@@ -286,9 +310,10 @@ int main(int argc, char** argv) {
     } else if (lsu::decodeRequest(buf, size_t(n), mode, pid)) {
       uint8_t reply[lsu::kRequestResultSize];
       lsu::encodeRequestResult(mode, pid, lsu::kRequestTxDisabled, reply);
-      sendto(sock, reply, sizeof(reply), 0, (sockaddr*)&from, sizeof(from));
+      sendto(controlSock, reply, sizeof(reply), 0, (sockaddr*)&from, sizeof(from));
     }
   }
-  close(sock);
+  close(controlSock);
+  close(dataSock);
   return 0;
 }

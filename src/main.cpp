@@ -2,12 +2,13 @@
 //
 // Tasks:
 //   capture  - TWAI receive (ACKs unless CAN_ACK=0, config.h), timestamps
-//              frames, queues them; sends the ISO-TP flow control for
-//              multi-frame OBD2 responses (lsu_obd.h)
-//              while a subscriber is active (SPEC.md §5.1)
-//   sender   - one CMP packet per CAN frame, UDP to the subscriber (§5.2)
-//   control  - receives SUBSCRIBE / UNSUBSCRIBE / REQUEST on the UDP port,
-//              replies STATUS / REQUEST_RESULT; puts whitelisted OBD2
+//              frames, queues them while a subscriber is active (SPEC.md
+//              §5.1); sends the ISO-TP flow control for multi-frame OBD2
+//              responses (lsu_obd.h)
+//   sender   - one CMP packet per CAN frame, UDP from the data port to the
+//              subscriber (§5.2)
+//   control  - receives SUBSCRIBE / UNSUBSCRIBE / REQUEST on the control
+//              port, replies STATUS / REQUEST_RESULT; puts whitelisted OBD2
 //              requests on the bus (SPEC.md §9)
 //   loop()   - LsuWifi web UI, ArduinoOTA, TCP log client and a periodic
 //              stats log (net_log.h: USB serial + TCP port kLogTcpPort)
@@ -51,7 +52,8 @@ struct Subscriber {
 const cmp::StreamConfig kStream = {kCmpDeviceId, kCmpStreamId, kCmpInterfaceId};
 
 QueueHandle_t frameQueue;
-int udpSocket = -1;
+int dataSocket = -1;     // sends CMP from kDataPort
+int controlSocket = -1;  // SUBSCRIBE / REQUEST in, STATUS / REQUEST_RESULT out
 
 portMUX_TYPE subMux = portMUX_INITIALIZER_UNLOCKED;
 Subscriber subscriber;  // guarded by subMux
@@ -118,25 +120,31 @@ void startTwai() {
                 CAN_BITRATE_KBPS, kCanRxGpio);
 }
 
-bool openSocket() {
-  udpSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-  if (udpSocket < 0) {
+int openUdpSocket(uint16_t port) {
+  int s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  if (s < 0) {
     netLog.printf("[udp] socket() failed: errno %d\n", errno);
-    return false;
+    return -1;
   }
   sockaddr_in local{};
   local.sin_family = AF_INET;
-  local.sin_port = htons(kUdpPort);
+  local.sin_port = htons(port);
   local.sin_addr.s_addr = htonl(INADDR_ANY);
-  if (bind(udpSocket, (sockaddr*)&local, sizeof(local)) < 0) {
-    netLog.printf("[udp] bind(%u) failed: errno %d\n", kUdpPort, errno);
-    close(udpSocket);
-    udpSocket = -1;
-    return false;
+  if (bind(s, (sockaddr*)&local, sizeof(local)) < 0) {
+    netLog.printf("[udp] bind(%u) failed: errno %d\n", port, errno);
+    close(s);
+    return -1;
   }
+  return s;
+}
+
+bool openSockets() {
+  dataSocket = openUdpSocket(kDataPort);
+  controlSocket = openUdpSocket(kControlPort);
+  if (dataSocket < 0 || controlSocket < 0) return false;
   // Lets the control task wake up to expire a silent subscriber.
   timeval tv = {0, 200 * 1000};
-  setsockopt(udpSocket, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+  setsockopt(controlSocket, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
   return true;
 }
 
@@ -225,7 +233,7 @@ void senderTask(void*) {
     uint64_t ts = (uint64_t)(q.rxUs * 1000 + s.offsetNs);
     size_t len = cmp::encodeCanPacket(kStream, sequenceCounter++, ts, flags,
                                       q.frame, packet);
-    if (sendto(udpSocket, packet, len, 0, (sockaddr*)&s.addr,
+    if (sendto(dataSocket, packet, len, 0, (sockaddr*)&s.addr,
                sizeof(s.addr)) == (int)len) {
       statSent++;
     } else {
@@ -254,7 +262,7 @@ lsu::Status currentStatus() {
 void sendStatus(const sockaddr_in& to) {
   uint8_t buf[lsu::kStatusSize];
   lsu::encodeStatus(currentStatus(), buf);
-  sendto(udpSocket, buf, sizeof(buf), 0, (const sockaddr*)&to, sizeof(to));
+  sendto(controlSocket, buf, sizeof(buf), 0, (const sockaddr*)&to, sizeof(to));
 }
 
 void controlTask(void*) {
@@ -262,7 +270,7 @@ void controlTask(void*) {
   for (;;) {
     sockaddr_in from{};
     socklen_t fromLen = sizeof(from);
-    int n = recvfrom(udpSocket, buf, sizeof(buf), 0, (sockaddr*)&from, &fromLen);
+    int n = recvfrom(controlSocket, buf, sizeof(buf), 0, (sockaddr*)&from, &fromLen);
     int64_t nowUs = esp_timer_get_time();
     char ip[16];
 
@@ -271,7 +279,7 @@ void controlTask(void*) {
     if (n > 0 && lsu::decodeRequest(buf, n, mode, pid)) {
       uint8_t reply[lsu::kRequestResultSize];
       lsu::encodeRequestResult(mode, pid, handleRequest(from, mode, pid), reply);
-      sendto(udpSocket, reply, sizeof(reply), 0, (sockaddr*)&from, sizeof(from));
+      sendto(controlSocket, reply, sizeof(reply), 0, (sockaddr*)&from, sizeof(from));
     } else if (n > 0 && lsu::decodeSubscribe(buf, n, laptopNs) && !otaInProgress) {
       portENTER_CRITICAL(&subMux);
       bool isNew = !subscriber.active || !sameAddr(subscriber.addr, from);
@@ -359,16 +367,16 @@ void setup() {
   Serial.begin(115200);
   netLog.printf("[boot] lsu-cmp, reset reason %d\n", (int)esp_reset_reason());
   frameQueue = xQueueCreate(kFrameQueueLen, sizeof(QueuedFrame));
-  startTwai();  // never transmits frames (at most ACK bits), safe before WiFi
+  startTwai();  // transmits only on a REQUEST, which needs WiFi: safe before it
 
   LsuWifi.begin();  // blocks until connected or the AP is up
-  netLog.printf("[net] %s, IP %s, UDP port %u\n",
+  netLog.printf("[net] %s, IP %s, UDP data port %u, control port %u\n",
                 LsuWifi.isApMode() ? "AP mode" : "station mode",
-                LsuWifi.ip().toString().c_str(), kUdpPort);
+                LsuWifi.ip().toString().c_str(), kDataPort, kControlPort);
   netLog.begin(kLogTcpPort);
   startOta();  // before the socket, so a bind failure can't block updates
 
-  if (!openSocket()) return;
+  if (!openSockets()) return;
   xTaskCreate(captureTask, "capture", 3072, nullptr, 5, nullptr);
   xTaskCreate(senderTask, "sender", 4096, nullptr, 4, nullptr);
   xTaskCreate(controlTask, "control", 4096, nullptr, 3, nullptr);

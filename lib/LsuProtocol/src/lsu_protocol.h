@@ -13,8 +13,12 @@
 // The answers of the ECUs, and the request itself, arrive as ordinary CAN
 // frames in the CMP stream.
 //
+// Two UDP ports on the ESP32: all messages above go to and come from the
+// control port; the CMP packets come from the data port, to the address
+// the SUBSCRIBE came from. So the data port carries nothing but CMP and
+// Wireshark decodes it cleanly (until 2026-10-17 everything shared 12670).
 // STATUS and REQUEST_RESULT start with "LSU" and CMP packets with version
-// 0x01, so the subscriber tells them apart by the first byte.
+// 0x01, so the content alone also tells them apart (old recordings).
 #pragma once
 
 #include <stddef.h>
@@ -23,7 +27,8 @@
 
 namespace lsu {
 
-constexpr uint16_t kDefaultPort = 12670;
+constexpr uint16_t kDataPort = 12670;     // CMP packets, ESP32 -> laptop
+constexpr uint16_t kControlPort = 12671;  // this protocol, both ways
 
 constexpr uint8_t kMagicSubscribe[4] = {'L', 'S', 'U', 'S'};
 constexpr uint8_t kMagicUnsubscribe[4] = {'L', 'S', 'U', 'U'};

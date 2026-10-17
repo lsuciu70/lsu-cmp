@@ -8,7 +8,7 @@
 // With --record it also writes every datagram from the ESP32 to a pcap file,
 // for Wireshark and for playback with cmp_replay.
 //
-// Usage: cmp_client [host] [--port 12670] [--quiet]
+// Usage: cmp_client [host] [--port 12671] [--quiet]
 //                   [--obd MODE:PID[,MODE:PID...]] [--interval MS]
 //                   [--record FILE.pcap]
 
@@ -120,21 +120,21 @@ void usage(const char* prog) {
   fprintf(stderr, "Usage: %s [host] [--port N] [--quiet] [--obd LIST] [--interval MS]\n"
                   "       [--record FILE.pcap]\n"
                   "  host        ESP32 IP (default 10.10.10.10, AP mode)\n"
-                  "  --port      UDP port (default %u)\n"
+                  "  --port      ESP32 control port (default %u; CMP comes from %u)\n"
                   "  --quiet     only a summary line every second (and OBD2 answers)\n"
                   "  --obd       OBD2 requests to send in turn, hex MODE:PID, comma\n"
                   "              separated, e.g. 01:0C,01:0D,09:02 (modes 01 and 09)\n"
                   "  --interval  ms between two requests (default 500, min 50)\n"
                   "  --record    also write everything received to a pcap file\n"
                   "              (Wireshark, cmp_replay)\n",
-          prog, lsu::kDefaultPort);
+          prog, lsu::kControlPort, lsu::kDataPort);
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
   std::string host = "10.10.10.10";
-  uint16_t port = lsu::kDefaultPort;
+  uint16_t port = lsu::kControlPort;
   bool quiet = false;
   std::vector<std::pair<uint8_t, uint8_t>> requests;
   int intervalMs = 500;
@@ -176,9 +176,10 @@ int main(int argc, char** argv) {
   uint64_t recorded = 0;
 
   CmpSubscriber::Callbacks cb;
-  cb.onPacket = [&](const uint8_t* data, size_t size) {
+  cb.onPacket = [&](const uint8_t* data, size_t size, uint16_t srcPort) {
     if (!recorder.isOpen()) return;
     record.timestampNs = uint64_t(unixNs());
+    record.srcPort = srcPort;
     record.payload.assign(data, data + size);
     if (recorder.write(record)) {
       recorded++;
@@ -222,8 +223,8 @@ int main(int argc, char** argv) {
   }
 
   if (!recordPath.empty()) {
-    // As seen on the wire: from the ESP32 to this socket.
-    if (!sub.endpoints(record.dstIp, record.dstPort, record.srcIp, record.srcPort) ||
+    // As seen on the wire: from the ESP32 (data or control port) to here.
+    if (!sub.addresses(record.dstIp, record.dstPort, record.srcIp) ||
         !recorder.open(recordPath, &error)) {
       fprintf(stderr, "%s\n", error.empty() ? "cannot read socket addresses" : error.c_str());
       return 1;

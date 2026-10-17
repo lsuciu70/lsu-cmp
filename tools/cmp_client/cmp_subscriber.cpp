@@ -33,25 +33,31 @@ CmpSubscriber::CmpSubscriber(Callbacks callbacks, Options options)
 
 CmpSubscriber::~CmpSubscriber() { close(); }
 
-bool CmpSubscriber::open(const std::string& host, uint16_t port, std::string* error) {
+bool CmpSubscriber::open(const std::string& host, uint16_t controlPort, std::string* error) {
   close();
   addrinfo hints{};
   hints.ai_family = AF_INET;
   hints.ai_socktype = SOCK_DGRAM;
   addrinfo* addr = nullptr;
-  if (int err = getaddrinfo(host.c_str(), std::to_string(port).c_str(), &hints, &addr)) {
+  if (int err = getaddrinfo(host.c_str(), std::to_string(controlPort).c_str(), &hints, &addr)) {
     if (error) *error = "cannot resolve " + host + ": " + gai_strerror(err);
     return false;
   }
+  // Not connect()ed: CMP comes from the data port, everything else from
+  // the control port. receive() keeps only packets from the ESP32's IP.
+  const sockaddr_in* esp = (const sockaddr_in*)addr->ai_addr;
+  _espIp = esp->sin_addr.s_addr;
+  _controlPort = esp->sin_port;
+  freeaddrinfo(addr);
   _sock = socket(AF_INET, SOCK_DGRAM, 0);
-  // connect(): send to the ESP32 with send(), and receive only its packets.
-  if (_sock < 0 || connect(_sock, addr->ai_addr, addr->ai_addrlen) < 0) {
+  // Bind now, so the port is known before the first send (addresses()).
+  sockaddr_in any{};
+  any.sin_family = AF_INET;
+  if (_sock < 0 || bind(_sock, (sockaddr*)&any, sizeof(any)) < 0) {
     if (error) *error = std::string("socket: ") + strerror(errno);
-    freeaddrinfo(addr);
     close();
     return false;
   }
-  freeaddrinfo(addr);
 
   _nextSubscribeMs = 0;
   _lastStatusMs = monoMs();
@@ -64,7 +70,7 @@ bool CmpSubscriber::open(const std::string& host, uint16_t port, std::string* er
 
 void CmpSubscriber::close() {
   if (_sock < 0) return;
-  send(_sock, lsu::kMagicUnsubscribe, lsu::kUnsubscribeSize, 0);
+  sendToEsp(lsu::kMagicUnsubscribe, lsu::kUnsubscribeSize);
   ::close(_sock);
   _sock = -1;
 }
@@ -88,28 +94,43 @@ bool CmpSubscriber::sendRequest(uint8_t mode, uint8_t pid) {
   if (_sock < 0) return false;
   uint8_t msg[lsu::kRequestSize];
   lsu::encodeRequest(mode, pid, msg);
-  return send(_sock, msg, sizeof(msg), 0) == ssize_t(sizeof(msg));
+  return sendToEsp(msg, sizeof(msg));
 }
 
-bool CmpSubscriber::endpoints(uint32_t& localIp, uint16_t& localPort, uint32_t& peerIp,
-                              uint16_t& peerPort) const {
-  sockaddr_in local{}, peer{};
-  socklen_t localLen = sizeof(local), peerLen = sizeof(peer);
-  if (_sock < 0 || getsockname(_sock, (sockaddr*)&local, &localLen) < 0 ||
-      getpeername(_sock, (sockaddr*)&peer, &peerLen) < 0)
-    return false;
-  localIp = ntohl(local.sin_addr.s_addr);
+bool CmpSubscriber::addresses(uint32_t& localIp, uint16_t& localPort, uint32_t& espIp) const {
+  sockaddr_in local{};
+  socklen_t len = sizeof(local);
+  if (_sock < 0 || getsockname(_sock, (sockaddr*)&local, &len) < 0) return false;
   localPort = ntohs(local.sin_port);
-  peerIp = ntohl(peer.sin_addr.s_addr);
-  peerPort = ntohs(peer.sin_port);
+  espIp = ntohl(_espIp);
+  // The unconnected socket is bound to 0.0.0.0: ask the routing table which
+  // local address reaches the ESP32 (connect() on UDP sends nothing).
+  int probe = socket(AF_INET, SOCK_DGRAM, 0);
+  sockaddr_in esp{};
+  esp.sin_family = AF_INET;
+  esp.sin_addr.s_addr = _espIp;
+  esp.sin_port = _controlPort;
+  bool ok = probe >= 0 && connect(probe, (sockaddr*)&esp, sizeof(esp)) == 0 &&
+            getsockname(probe, (sockaddr*)&local, &len) == 0;
+  if (probe >= 0) ::close(probe);
+  if (!ok) return false;
+  localIp = ntohl(local.sin_addr.s_addr);
   return true;
+}
+
+bool CmpSubscriber::sendToEsp(const uint8_t* data, size_t size) {
+  sockaddr_in esp{};
+  esp.sin_family = AF_INET;
+  esp.sin_addr.s_addr = _espIp;
+  esp.sin_port = _controlPort;
+  return sendto(_sock, data, size, 0, (sockaddr*)&esp, sizeof(esp)) == ssize_t(size);
 }
 
 void CmpSubscriber::sendSubscribe(int64_t nowMs) {
   uint8_t msg[lsu::kSubscribeSize];
   lsu::encodeSubscribe(unixNs(), msg);
   // Failures (e.g. network down) show up as onUnreachable.
-  send(_sock, msg, sizeof(msg), 0);
+  sendToEsp(msg, sizeof(msg));
   _nextSubscribeMs = nowMs + _opt.subscribeIntervalMs;
 }
 
@@ -117,14 +138,17 @@ void CmpSubscriber::receive() {
   // Drain everything queued, so a burst of frames is handled in one poll().
   uint8_t buf[2048];
   for (;;) {
-    ssize_t n = recv(_sock, buf, sizeof(buf), MSG_DONTWAIT);
-    if (n < 0) return;  // EAGAIN, or ECONNREFUSED (nothing listening yet)
-    handlePacket(buf, size_t(n));
+    sockaddr_in from{};
+    socklen_t fromLen = sizeof(from);
+    ssize_t n = recvfrom(_sock, buf, sizeof(buf), MSG_DONTWAIT, (sockaddr*)&from, &fromLen);
+    if (n < 0) return;  // EAGAIN
+    if (from.sin_addr.s_addr != _espIp) continue;  // not from the ESP32
+    handlePacket(buf, size_t(n), ntohs(from.sin_port));
   }
 }
 
-void CmpSubscriber::handlePacket(const uint8_t* data, size_t size) {
-  if (_cb.onPacket) _cb.onPacket(data, size);
+void CmpSubscriber::handlePacket(const uint8_t* data, size_t size, uint16_t srcPort) {
+  if (_cb.onPacket) _cb.onPacket(data, size, srcPort);
   uint8_t mode, pid, result;
   if (lsu::decodeRequestResult(data, size, mode, pid, result)) {
     if (_cb.onRequestResult) _cb.onRequestResult(mode, pid, result);

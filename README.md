@@ -51,7 +51,7 @@ Things to keep in mind (not yet measured or verified):
 | Toolchain | PlatformIO, Arduino framework; TWAI through ESP-IDF's `driver/twai.h` |
 | TWAI mode | normal (`CAN_ACK=1`): ACKs frames, transmits only OBD2 requests and their flow control; `CAN_ACK=0` = listen-only, no requests |
 | deviceId / streamId | 1 / 1, chosen locally, **not** from an official ASAM registry |
-| UDP port | 12670, arbitrary, **not** an IANA-registered port for CMP |
+| UDP ports | 12670 (data: CMP only) and 12671 (control: own protocol), arbitrary, **not** IANA-registered |
 | Destination | subscription model: the laptop subscribes to the ESP32, which sends unicast to the subscriber |
 | WiFi | [LsuWifi](README-WIFI.md) library; default AP `lsu-cmp` / `12345678` at `10.10.10.10` |
 | interfaceId | 0, arbitrary, a single physical CAN channel |
@@ -61,8 +61,12 @@ The configuration is in [src/config.h](src/config.h).
 
 ## Subscription protocol (own, not part of ASAM CMP)
 
-UDP port 12670, big-endian. One definition shared by the firmware and the
-C++ client: [lib/LsuProtocol/src/lsu_protocol.h](lib/LsuProtocol/src/lsu_protocol.h).
+Control port 12671, big-endian. One definition shared by the firmware and
+the C++ client: [lib/LsuProtocol/src/lsu_protocol.h](lib/LsuProtocol/src/lsu_protocol.h).
+All messages below go to and come from the ESP32's control port; the CMP
+packets come from its data port 12670, which carries nothing else. Until
+2026-10-17 everything shared 12670, and Wireshark showed the own messages
+as malformed CMP packets.
 
 | Message | Direction | Content |
 |---|---|---|
@@ -79,7 +83,8 @@ C++ client: [lib/LsuProtocol/src/lsu_protocol.h](lib/LsuProtocol/src/lsu_protoco
   is the moment the CAN frame was received, in laptop time, accurate to about
   the WiFi latency (a few ms, no compensation). Nothing is sent without a
   subscriber, so every packet carries the `insync` flag.
-- CMP packets are sent from port 12670 to the subscriber's IP:port.
+- CMP packets are sent from port 12670 to the IP:port the SUBSCRIBE came
+  from.
 - STATUS holds the CAN controller state (running / bus-off / ...), bitrate,
   frames received, packets sent, frames dropped (full queues, overrun), UDP
   send errors, bus errors and uptime. This lets the client tell an
@@ -107,10 +112,21 @@ C++ client: [lib/LsuProtocol/src/lsu_protocol.h](lib/LsuProtocol/src/lsu_protoco
 ## CMP format
 
 One CAN frame = one UDP datagram of 40–48 bytes (CmpHeader + MessageHeader +
-CAN payload), as in SPEC.md §4, with one clarification: the `0xFFFFFF1F` mask
-in the openDAQ library is applied to the raw word as read on a little-endian
-host. On the wire (big-endian) the `id` field holds the ID in bits 0–28,
-`rsvd` in bit 29, `RTR` in bit 30 and `IDE` in bit 31. The encoder
+CAN payload), as in SPEC.md §4, with two clarifications on the `id` field
+(big-endian on the wire): `rsvd` is bit 29, `RTR` bit 30, `IDE` bit 31
+(the `0xFFFFFF1F` mask in the openDAQ library applies to the raw word as
+read on a little-endian host), and
+
+- a 29-bit ID fills bits 0–28;
+- an 11-bit ID sits in **bits 18–28**, as Wireshark 4.6 decodes it by
+  default. The openDAQ library puts it in bits 0–10, which Wireshark calls
+  "the old encoding" (preference `asam-cmp.use_old_canid_11bit_format`);
+  so did this firmware until 2026-10-17. We have no access to the ASAM
+  standard itself, so which one it specifies is not verified; Wireshark's
+  default was chosen. The decoder reads both, so older recordings still
+  play back correctly.
+
+Apart from that bit position the encoder
 ([lib/CmpCodec](lib/CmpCodec/src/cmp_encoder.h)) was checked byte for byte
 against packets built with openDAQ/ASAM-CMP-Library.
 
@@ -152,10 +168,9 @@ the internal queue.
    Recording: `--record drive.pcap` also writes every datagram from the
    ESP32 (CMP, STATUS, REQUEST_RESULT) to a pcap file, with its arrival
    time in ns (see "Recording and playback" below).
-4. Validation (SPEC.md §7): Wireshark on the same interface, *Decode As…*
-   UDP port 12670 → ASAM CMP. Wireshark 4.2.2 (the laptop's version) does
-   not offer ASAM CMP under *Decode As* for UDP: its dissector is reached
-   only through TECMP. Not checked with newer versions.
+4. Validation (SPEC.md §7): Wireshark 4.6 decodes port 12670 as ASAM CMP
+   (verified with 4.6.6 on a recording). Wireshark 4.2.2 did not offer
+   ASAM CMP for UDP at all.
 
 ## Recording and playback
 
@@ -166,7 +181,8 @@ tools/cmp_client/build/cmp_client 127.0.0.1
 ```
 
 `cmp_replay` plays the recording back as if it were the ESP32, on
-`127.0.0.1:12670` (`--bind`, `--port`), so any client works against it
+`127.0.0.1`, data port 12670 and control port 12671 (`--bind`,
+`--data-port`, `--control-port`), so any client works against it
 unchanged, at home, without the car:
 
 - It answers SUBSCRIBE with the recorded STATUS for the current position
@@ -184,7 +200,7 @@ unchanged, at home, without the car:
 Recordings are classic pcap with nanosecond timestamps and bare IPv4/UDP
 headers (LINKTYPE_RAW). The player also reads Wireshark/tcpdump captures
 in classic pcap (Ethernet or Linux cooked), not pcapng; it plays only the
-datagrams sent from port 12670.
+datagrams sent from port 12670 or 12671.
 
 Log: `pio device monitor` over WiFi (TCP port 23, 192.168.100.240 by
 default; in AP mode `--port socket://10.10.10.10:23`), or

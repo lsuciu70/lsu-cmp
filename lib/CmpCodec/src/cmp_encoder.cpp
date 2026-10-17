@@ -53,7 +53,7 @@ size_t encodeCanPacket(const StreamConfig& cfg, uint16_t sequenceCounter,
   uint8_t* c = m + kMessageHeaderSize;
   put16(c, 0);      // flags: no error bits
   put16(c + 2, 0);  // reserved
-  uint32_t id = frame.id & kIdMask;
+  uint32_t id = frame.extended ? frame.id & kIdMask : (frame.id & 0x7FF) << kId11Shift;
   if (frame.rtr) id |= kIdRtr;
   if (frame.extended) id |= kIdIde;
   put32(c + 4, id);

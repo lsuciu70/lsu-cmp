@@ -38,8 +38,13 @@ bool decodeCanPacket(const uint8_t* packet, size_t size, DecodedCanPacket& out) 
   out.commonFlags = m[12];
   out.canFlags = get16(c);
   uint32_t id = get32(c + 4);
-  out.frame.id = id & kIdMask;
   out.frame.extended = (id & kIdIde) != 0;
+  if (out.frame.extended)
+    out.frame.id = id & kIdMask;
+  else if (id & kId11Mask)
+    out.frame.id = (id & kId11Mask) >> kId11Shift;
+  else
+    out.frame.id = id & kId11MaskOld;  // old encoding (or ID 0)
   out.frame.rtr = (id & kIdRtr) != 0;
   out.frame.dlc = c[14];
   memset(out.frame.data, 0, sizeof(out.frame.data));

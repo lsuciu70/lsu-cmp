@@ -87,6 +87,8 @@ offset  size  field
 - bit masked with `0x80` = IDE (extended ID, 29-bit vs 11-bit)
 
 > **Note (added after implementation):** these masks apply to the raw 32-bit word as read by the library on a little-endian host, not to the big-endian value on the wire. On the wire the `id` field holds the CAN ID in bits 0–28, `rsvd` in bit 29, `RTR` in bit 30 and `IDE` in bit 31. See [README.md, "CMP format"](README.md#cmp-format).
+>
+> **Note (2026-10-17):** for an **11-bit** ID the library uses bits 0–10, but Wireshark 4.6 decodes it by default from **bits 18–28** (the base-ID position of an extended ID) and keeps bits 0–10 only as "the old encoding" preference. With our first recording, Wireshark 4.6 read every 11-bit ID as 0 and showed the OBD2 frames as AUTOSAR NM. The firmware now writes bits 18–28; the decoder accepts both. The ASAM standard itself was not available to settle which is correct.
 
 **Bit packing of the `crc` field (4 bytes, offset 8):** holds the CAN CRC + CRC support + SBC (stuff bit count) + parity. Fine details, less critical for a simple sender (we can put 0 if we do not compute the real CRC of the received frame; the ESP32 TWAI does not expose the raw frame CRC through the standard API; to be checked during implementation whether any workaround exists or whether it is left 0/unsupported).
 
@@ -106,7 +108,7 @@ offset  size  field
 
 - **Toolchain:** native ESP-IDF (direct access to `driver/twai.h`) or the Arduino framework (through PlatformIO, which also has `twai.h` available on the recent ESP32 Arduino core). To be chosen explicitly: native ESP-IDF gives finer control, Arduino is faster to prototype.
 - **deviceId / streamId:** arbitrary values chosen by us (there is no central ASAM registry for hobby projects), e.g. deviceId=1, streamId=1. To be clearly documented in the code as "chosen locally, not from an official registry".
-- **Destination UDP port:** there is no confirmed standard IANA port for CMP; choose an arbitrary port (e.g. 50000) and document it as such, not as "standard".
+- **Destination UDP port:** there is no confirmed standard IANA port for CMP; choose an arbitrary port (e.g. 50000) and document it as such, not as "standard". (Chosen: 12670 for CMP only, 12671 for the own control protocol; see README.)
 - **Destination IP (data sink):** static IP configured in code, or broadcast/multicast? To be decided.
 - **WiFi credentials:** hardcoded in code (simple, for a prototype) or through a configuration mechanism (e.g. WiFiManager)? To be decided based on workflow preference.
 - **interfaceId (in MessageHeader):** fixed arbitrary value (e.g. 0) as long as there is a single physical CAN channel.
