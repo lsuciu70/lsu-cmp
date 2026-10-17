@@ -148,8 +148,43 @@ the internal queue.
    rpm`), refused requests on lines starting with `>`. Decoded: supported
    PIDs (01 00, 20, 40, ...), a dozen common mode 01 PIDs, VIN and ECU
    name; anything else is shown in hex.
+
+   Recording: `--record drive.pcap` also writes every datagram from the
+   ESP32 (CMP, STATUS, REQUEST_RESULT) to a pcap file, with its arrival
+   time in ns (see "Recording and playback" below).
 4. Validation (SPEC.md §7): Wireshark on the same interface, *Decode As…*
-   UDP port 12670 → ASAM CMP.
+   UDP port 12670 → ASAM CMP. Wireshark 4.2.2 (the laptop's version) does
+   not offer ASAM CMP under *Decode As* for UDP: its dissector is reached
+   only through TECMP. Not checked with newer versions.
+
+## Recording and playback
+
+```
+tools/cmp_client/build/cmp_client 192.168.100.240 --obd 01:0C,01:0D --record drive.pcap
+tools/cmp_client/build/cmp_replay drive.pcap [--speed 4] [--loop]
+tools/cmp_client/build/cmp_client 127.0.0.1
+```
+
+`cmp_replay` plays the recording back as if it were the ESP32, on
+`127.0.0.1:12670` (`--bind`, `--port`), so any client works against it
+unchanged, at home, without the car:
+
+- It answers SUBSCRIBE with the recorded STATUS for the current position
+  and sends the recorded CMP packets with their original spacing, scaled
+  by `--speed`. Playback runs only while someone is subscribed, and pauses
+  when the subscriber leaves.
+- CMP timestamps are moved to the present, keeping each frame's original
+  age (capture on the ESP32 → arrival on the laptop); `--keep-time` sends
+  them unchanged.
+- REQUESTs are refused with "transmit disabled": the requests and answers
+  of the drive are already in the recording.
+- `--loop` starts again at the end; sequence numbers keep counting up and
+  the last STATUS stays, so the client sees no gap or restart.
+
+Recordings are classic pcap with nanosecond timestamps and bare IPv4/UDP
+headers (LINKTYPE_RAW). The player also reads Wireshark/tcpdump captures
+in classic pcap (Ethernet or Linux cooked), not pcapng; it plays only the
+datagrams sent from port 12670.
 
 Log: `pio device monitor` over WiFi (TCP port 23, 192.168.100.240 by
 default; in AP mode `--port socket://10.10.10.10:23`), or
@@ -167,9 +202,11 @@ errors. If `bus_err` grows a lot, try 250 kbit/s:
 
 | File | Role |
 |---|---|
-| [cmp_subscriber.h](tools/cmp_client/cmp_subscriber.h) / `.cpp` | The reusable part: socket, periodic SUBSCRIBE, STATUS, sequence tracking, unreachable detection, `sendRequest()`. No output, no threads; events through callbacks (`onFrame`, `onGap`, `onStatus`, `onUnreachable`, `onReachable`, `onRequestResult`, `onUnknownPacket`). |
+| [cmp_subscriber.h](tools/cmp_client/cmp_subscriber.h) / `.cpp` | The reusable part: socket, periodic SUBSCRIBE, STATUS, sequence tracking, unreachable detection, `sendRequest()`, `endpoints()`. No output, no threads; events through callbacks (`onPacket` for the raw datagrams, `onFrame`, `onGap`, `onStatus`, `onUnreachable`, `onReachable`, `onRequestResult`, `onUnknownPacket`). |
 | [obd_decoder.h](tools/cmp_client/obd_decoder.h) / `.cpp` | OBD2 answers from the CAN frames: ISO-TP reassembly per ECU, values for common PIDs. |
 | [main.cpp](tools/cmp_client/main.cpp) | The test client: command line and printing of the callbacks. |
+| [pcap_file.h](tools/cmp_client/pcap_file.h) / `.cpp` | pcap writer (recording) and reader (playback). |
+| [replay.cpp](tools/cmp_client/replay.cpp) | `cmp_replay`: plays a recording back as if it were the ESP32. |
 | [lib/CmpCodec](lib/CmpCodec/src/) | CMP encoder (firmware) and decoder (client), shared. |
 | [lib/LsuProtocol](lib/LsuProtocol/src/lsu_protocol.h) | The subscription protocol, shared. |
 | [lib/LsuObd](lib/LsuObd/src/lsu_obd.h) | OBD2 IDs, request whitelist, request and flow control frames, shared. |
@@ -179,6 +216,7 @@ CMake builds the reusable part as the static library `cmp_subscriber`
 uses the same sources and writes its own `main`.
 
 Host tests (encoder, decoder, protocol, OBD2 frames): `pio test -e native`.
+pcap reader and writer: `ctest --test-dir tools/cmp_client/build`.
 
 ## Credits
 

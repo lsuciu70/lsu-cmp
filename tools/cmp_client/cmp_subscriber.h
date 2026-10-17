@@ -26,6 +26,9 @@
 class CmpSubscriber {
  public:
   struct Callbacks {
+    // Every datagram from the ESP32 as received, before the callbacks
+    // below (for recording, see pcap_file.h).
+    std::function<void(const uint8_t* data, size_t size)> onPacket;
     // One CAN frame (one CMP packet), in arrival order.
     std::function<void(const cmp::DecodedCanPacket&)> onFrame;
     // sequenceCounter jumped: `lost` packets were not received.
@@ -68,6 +71,11 @@ class CmpSubscriber {
   // outcome comes in onRequestResult, the request and the ECU answers as
   // CAN frames in onFrame. False if not open or the send failed.
   bool sendRequest(uint8_t mode, uint8_t pid);
+
+  // IPv4 addresses (host byte order) and ports of this socket and of the
+  // ESP32. False if not open.
+  bool endpoints(uint32_t& localIp, uint16_t& localPort, uint32_t& peerIp,
+                 uint16_t& peerPort) const;
 
   int fd() const { return _sock; }
   bool reachable() const { return _reachable; }

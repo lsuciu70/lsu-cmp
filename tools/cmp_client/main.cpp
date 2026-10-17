@@ -5,9 +5,12 @@
 // status at subscription and whenever it changes (CAN state, bus errors,
 // drops, restarts), and idle periods. With --obd it also asks the ESP32
 // for OBD2 requests, in turn, and prints the decoded answers (ObdDecoder).
+// With --record it also writes every datagram from the ESP32 to a pcap file,
+// for Wireshark and for playback with cmp_replay.
 //
 // Usage: cmp_client [host] [--port 12670] [--quiet]
 //                   [--obd MODE:PID[,MODE:PID...]] [--interval MS]
+//                   [--record FILE.pcap]
 
 #include <algorithm>
 #include <chrono>
@@ -20,6 +23,7 @@
 
 #include "cmp_subscriber.h"
 #include "obd_decoder.h"
+#include "pcap_file.h"
 
 namespace {
 
@@ -114,12 +118,15 @@ bool parseObdList(const std::string& s, std::vector<std::pair<uint8_t, uint8_t>>
 
 void usage(const char* prog) {
   fprintf(stderr, "Usage: %s [host] [--port N] [--quiet] [--obd LIST] [--interval MS]\n"
+                  "       [--record FILE.pcap]\n"
                   "  host        ESP32 IP (default 10.10.10.10, AP mode)\n"
                   "  --port      UDP port (default %u)\n"
                   "  --quiet     only a summary line every second (and OBD2 answers)\n"
                   "  --obd       OBD2 requests to send in turn, hex MODE:PID, comma\n"
                   "              separated, e.g. 01:0C,01:0D,09:02 (modes 01 and 09)\n"
-                  "  --interval  ms between two requests (default 500, min 50)\n",
+                  "  --interval  ms between two requests (default 500, min 50)\n"
+                  "  --record    also write everything received to a pcap file\n"
+                  "              (Wireshark, cmp_replay)\n",
           prog, lsu::kDefaultPort);
 }
 
@@ -131,6 +138,7 @@ int main(int argc, char** argv) {
   bool quiet = false;
   std::vector<std::pair<uint8_t, uint8_t>> requests;
   int intervalMs = 500;
+  std::string recordPath;
   for (int i = 1; i < argc; i++) {
     std::string a = argv[i];
     if (a == "--port" && i + 1 < argc) {
@@ -142,6 +150,8 @@ int main(int argc, char** argv) {
       }
     } else if (a == "--interval" && i + 1 < argc) {
       intervalMs = std::max(50, std::stoi(argv[++i]));
+    } else if (a == "--record" && i + 1 < argc) {
+      recordPath = argv[++i];
     } else if (a == "--quiet") {
       quiet = true;
     } else if (a == "-h" || a == "--help") {
@@ -161,8 +171,22 @@ int main(int argc, char** argv) {
   lsu::Status prevStatus{};
 
   ObdDecoder obdDecoder;
+  PcapWriter recorder;
+  UdpRecord record{};  // addresses filled in once the socket is open
+  uint64_t recorded = 0;
 
   CmpSubscriber::Callbacks cb;
+  cb.onPacket = [&](const uint8_t* data, size_t size) {
+    if (!recorder.isOpen()) return;
+    record.timestampNs = uint64_t(unixNs());
+    record.payload.assign(data, data + size);
+    if (recorder.write(record)) {
+      recorded++;
+    } else {
+      fprintf(stderr, "! write to %s failed, recording stopped\n", recordPath.c_str());
+      recorder.close();
+    }
+  };
   cb.onFrame = [&](const cmp::DecodedCanPacket& p) {
     perSecond++;
     lastFrameMs = monoMs();
@@ -197,6 +221,16 @@ int main(int argc, char** argv) {
     return 1;
   }
 
+  if (!recordPath.empty()) {
+    // As seen on the wire: from the ESP32 to this socket.
+    if (!sub.endpoints(record.dstIp, record.dstPort, record.srcIp, record.srcPort) ||
+        !recorder.open(recordPath, &error)) {
+      fprintf(stderr, "%s\n", error.empty() ? "cannot read socket addresses" : error.c_str());
+      return 1;
+    }
+    printf("recording to %s\n", recordPath.c_str());
+  }
+
   std::signal(SIGINT, onSignal);
   std::signal(SIGTERM, onSignal);
   setvbuf(stdout, nullptr, _IOLBF, 0);
@@ -204,12 +238,17 @@ int main(int argc, char** argv) {
 
   int64_t lastReport = monoMs();
   int64_t lastIdle = monoMs();
+  int64_t lastFlush = monoMs();
   int64_t nextRequestMs = 0;
   size_t nextRequest = 0;
   while (!stopRequested) {
     sub.poll(requests.empty() ? 100 : 10);
 
     int64_t now = monoMs();
+    if (now - lastFlush >= 1000) {  // lose at most a second on a crash
+      recorder.flush();
+      lastFlush = now;
+    }
     // Requests only once subscribed: the ESP32 refuses them otherwise.
     if (!requests.empty() && sub.hasStatus() && sub.reachable() && now >= nextRequestMs) {
       sub.sendRequest(requests[nextRequest].first, requests[nextRequest].second);
@@ -243,5 +282,7 @@ int main(int argc, char** argv) {
   printf("\nunsubscribed. %llu frames, %llu lost, %llu unexpected packets\n",
          (unsigned long long)c.frames, (unsigned long long)c.lost,
          (unsigned long long)c.unknown);
+  if (!recordPath.empty())
+    printf("recorded %llu packets to %s\n", (unsigned long long)recorded, recordPath.c_str());
   return 0;
 }

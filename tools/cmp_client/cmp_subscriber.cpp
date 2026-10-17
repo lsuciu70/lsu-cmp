@@ -1,5 +1,6 @@
 #include "cmp_subscriber.h"
 
+#include <arpa/inet.h>
 #include <netdb.h>
 #include <poll.h>
 #include <sys/socket.h>
@@ -90,6 +91,20 @@ bool CmpSubscriber::sendRequest(uint8_t mode, uint8_t pid) {
   return send(_sock, msg, sizeof(msg), 0) == ssize_t(sizeof(msg));
 }
 
+bool CmpSubscriber::endpoints(uint32_t& localIp, uint16_t& localPort, uint32_t& peerIp,
+                              uint16_t& peerPort) const {
+  sockaddr_in local{}, peer{};
+  socklen_t localLen = sizeof(local), peerLen = sizeof(peer);
+  if (_sock < 0 || getsockname(_sock, (sockaddr*)&local, &localLen) < 0 ||
+      getpeername(_sock, (sockaddr*)&peer, &peerLen) < 0)
+    return false;
+  localIp = ntohl(local.sin_addr.s_addr);
+  localPort = ntohs(local.sin_port);
+  peerIp = ntohl(peer.sin_addr.s_addr);
+  peerPort = ntohs(peer.sin_port);
+  return true;
+}
+
 void CmpSubscriber::sendSubscribe(int64_t nowMs) {
   uint8_t msg[lsu::kSubscribeSize];
   lsu::encodeSubscribe(unixNs(), msg);
@@ -109,6 +124,7 @@ void CmpSubscriber::receive() {
 }
 
 void CmpSubscriber::handlePacket(const uint8_t* data, size_t size) {
+  if (_cb.onPacket) _cb.onPacket(data, size);
   uint8_t mode, pid, result;
   if (lsu::decodeRequestResult(data, size, mode, pid, result)) {
     if (_cb.onRequestResult) _cb.onRequestResult(mode, pid, result);
