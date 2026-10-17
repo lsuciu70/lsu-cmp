@@ -1,0 +1,179 @@
+// Talks to the lsu-cmp ESP32 the way tools/cmp_client does: resends
+// SUBSCRIBE every second, asks for OBD2 requests in turn, and decodes the
+// CMP stream into OBD2 values. Publishes everything as one StateFlow.
+//
+// Finding the board: with no host given, SUBSCRIBE goes out as a broadcast
+// on every local network (e.g. the phone's hotspot, where the board's IP is
+// whatever the phone handed out). The board answers a SUBSCRIBE with STATUS
+// from its control port; that answer tells the app the board's address.
+package io.github.lsuciu70.lsucmp
+
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import java.net.DatagramPacket
+import java.net.DatagramSocket
+import java.net.Inet4Address
+import java.net.InetAddress
+import java.net.InetSocketAddress
+import java.net.NetworkInterface
+import java.net.SocketTimeoutException
+
+class CmpClient(private val scope: CoroutineScope) {
+
+    enum class Phase { IDLE, SEARCHING, CONNECTED, UNREACHABLE }
+
+    data class State(
+        val phase: Phase = Phase.IDLE,
+        val esp: String? = null,
+        val status: Lsu.Status? = null,
+        /** Latest answer per (mode shl 8 or pid), with its arrival time. */
+        val values: Map<Int, Pair<ObdValue, Long>> = emptyMap(),
+        val frames: Long = 0,
+        val lost: Long = 0,
+        val refused: Long = 0,
+        val lastRefusal: String? = null,
+        val error: String? = null,
+    )
+
+    private val _state = MutableStateFlow(State())
+    val state: StateFlow<State> = _state
+    private var job: Job? = null
+
+    /**
+     * Starts talking to [host] (an IP or name), or searches the local
+     * networks when it is blank. [requests] are (mode, pid) pairs sent in
+     * turn every [intervalMs]; mode 09 requests stop once answered.
+     */
+    fun start(host: String, requests: List<Pair<Int, Int>>, intervalMs: Long) {
+        stop()
+        _state.value = State(phase = Phase.SEARCHING)
+        job = scope.launch(Dispatchers.IO) {
+            try {
+                run(host.trim(), requests, intervalMs)
+            } catch (e: Exception) {
+                _state.update { it.copy(phase = Phase.IDLE, error = e.message ?: e.toString()) }
+            }
+        }
+    }
+
+    fun stop() {
+        job?.cancel()
+        job = null
+        _state.update { it.copy(phase = Phase.IDLE) }
+    }
+
+    private suspend fun run(host: String, requests: List<Pair<Int, Int>>, intervalMs: Long) {
+        val fixed: InetAddress? = if (host.isEmpty()) null else InetAddress.getByName(host)
+        var esp: InetAddress? = fixed
+        val socket = DatagramSocket(null).apply {
+            reuseAddress = true
+            broadcast = true
+            soTimeout = 20
+            bind(InetSocketAddress(0))
+        }
+        val decoder = ObdDecoder()
+        val pending = requests.toMutableList()
+        val buf = ByteArray(2048)
+        val packet = DatagramPacket(buf, buf.size)
+        var nextSubscribe = 0L
+        var nextRequest = 0L
+        var requestIndex = 0
+        var lastStatus = System.currentTimeMillis()
+        var expectedSeq = -1
+
+        fun send(data: ByteArray, to: InetAddress) =
+            socket.send(DatagramPacket(data, data.size, to, Lsu.CONTROL_PORT))
+
+        try {
+            while (currentCoroutineContext().isActive) {
+                val now = System.currentTimeMillis()
+                if (now >= nextSubscribe) {
+                    val msg = Lsu.subscribe(now * 1_000_000)
+                    val target = esp
+                    if (target != null) send(msg, target) else broadcastAddresses().forEach { send(msg, it) }
+                    nextSubscribe = now + 1000
+                }
+                val reachable = esp != null && now - lastStatus < 3000
+                if (reachable && pending.isNotEmpty() && now >= nextRequest) {
+                    requestIndex %= pending.size
+                    val (mode, pid) = pending[requestIndex++]
+                    send(Lsu.request(mode, pid), esp!!)
+                    nextRequest = now + intervalMs
+                }
+                if (esp != null && now - lastStatus >= 3000) {
+                    // Searching again lets a board that got a new IP be found.
+                    if (fixed == null && now - lastStatus >= 6000) esp = null
+                    _state.update {
+                        it.copy(phase = if (esp == null) Phase.SEARCHING else Phase.UNREACHABLE)
+                    }
+                }
+
+                try {
+                    socket.receive(packet)
+                } catch (_: SocketTimeoutException) {
+                    continue
+                }
+                val from = packet.address
+                val n = packet.length
+                if (esp == null) {
+                    // Only a STATUS identifies the board.
+                    if (packet.port != Lsu.CONTROL_PORT || Lsu.decodeStatus(buf, n) == null) continue
+                    esp = from
+                } else if (from != esp) {
+                    continue
+                }
+
+                Lsu.decodeStatus(buf, n)?.let { st ->
+                    lastStatus = System.currentTimeMillis()
+                    _state.update {
+                        it.copy(phase = Phase.CONNECTED, esp = from.hostAddress, status = st, error = null)
+                    }
+                }
+                Lsu.decodeRequestResult(buf, n)?.let { r ->
+                    if (r.result != Lsu.REQUEST_SENT) _state.update {
+                        it.copy(
+                            refused = it.refused + 1,
+                            lastRefusal = "%02X %02X: %s".format(r.mode, r.pid, r.resultName),
+                        )
+                    }
+                }
+                Cmp.decode(buf, n)?.let { pkt ->
+                    val lost = if (expectedSeq >= 0) (pkt.sequenceCounter - expectedSeq) and 0xFFFF else 0
+                    expectedSeq = (pkt.sequenceCounter + 1) and 0xFFFF
+                    val answer = decoder.feed(pkt.frame)
+                    if (answer != null && answer.mode == Obd.MODE_VEHICLE_INFO)
+                        pending.remove(answer.mode to answer.pid)
+                    _state.update {
+                        it.copy(
+                            frames = it.frames + 1,
+                            lost = it.lost + lost,
+                            values = if (answer == null) it.values
+                            else it.values + ((answer.mode shl 8 or answer.pid) to
+                                (answer to System.currentTimeMillis())),
+                        )
+                    }
+                }
+            }
+        } finally {
+            esp?.let { runCatching { send(Lsu.unsubscribe(), it) } }
+            socket.close()
+            _state.update { it.copy(phase = Phase.IDLE) }
+        }
+    }
+
+    /** Broadcast address of every IPv4 network the phone is on. */
+    private fun broadcastAddresses(): List<InetAddress> =
+        NetworkInterface.getNetworkInterfaces().toList()
+            .filter { it.isUp && !it.isLoopback }
+            .flatMap { it.interfaceAddresses }
+            .filter { it.address is Inet4Address }
+            .mapNotNull { it.broadcast }
+            .distinct()
+}

@@ -234,6 +234,34 @@ uses the same sources and writes its own `main`.
 Host tests (encoder, decoder, protocol, OBD2 frames): `pio test -e native`.
 pcap reader and writer: `ctest --test-dir tools/cmp_client/build`.
 
+## Android app
+
+[android/](android/) (Kotlin, Jetpack Compose, Android 10+; tested on a
+Galaxy S23 Ultra with Android 16): a dashboard on the phone with large
+tiles for engine speed, vehicle speed, intake manifold pressure, coolant,
+voltage, throttle, MAF and load, plus the VIN. It speaks the same protocol
+as `cmp_client` ([Protocol.kt](android/app/src/main/java/io/github/lsuciu70/lsucmp/Protocol.kt),
+[ObdDecoder.kt](android/app/src/main/java/io/github/lsuciu70/lsucmp/ObdDecoder.kt),
+ports of the C++ sources, with the same golden-byte tests) and requests
+those PIDs in turn every 150 ms.
+
+- **Finding the board:** with the IP field blank, SUBSCRIBE goes out as a
+  broadcast on every network the phone is on; the board's STATUS reply
+  gives its address. Meant for the car, where the board joins the phone's
+  hotspot (add the hotspot as a network on the board's web page) and gets
+  whatever IP the phone hands out. A fixed IP can be typed in instead.
+- **At home without the car:** `cmp_replay drive.pcap --bind 0.0.0.0
+  --loop` on the laptop; the app finds it the same way.
+- Values older than 3 s are dimmed; the screen stays on while connected.
+
+Build and install (Android SDK in `~/Android/Sdk`, USB debugging on):
+
+```
+cd android
+./gradlew testDebugUnitTest assembleDebug
+~/Android/Sdk/platform-tools/adb install -r app/build/outputs/apk/debug/app-debug.apk
+```
+
 ## Credits
 
 Firmware, test client and documentation were developed together with
