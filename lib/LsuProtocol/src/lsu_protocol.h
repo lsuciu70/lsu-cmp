@@ -5,9 +5,16 @@
 //   laptop -> ESP32  SUBSCRIBE    "LSUS" + uint64 laptop time, ns since epoch
 //   laptop -> ESP32  UNSUBSCRIBE  "LSUU"
 //   ESP32 -> laptop  STATUS       reply to every SUBSCRIBE (layout below)
+//   laptop -> ESP32  REQUEST      "LSUR" + OBD2 mode + PID: put one OBD2
+//                                 request on the bus (lsu_obd.h, SPEC.md §9)
+//   ESP32 -> laptop  REQUEST_RESULT  "LSUK" + mode + PID + RequestResult,
+//                                 reply to every REQUEST
 //
-// STATUS starts with "LSUA" and CMP packets with version 0x01, so the
-// subscriber tells them apart by the first byte.
+// The answers of the ECUs, and the request itself, arrive as ordinary CAN
+// frames in the CMP stream.
+//
+// STATUS and REQUEST_RESULT start with "LSU" and CMP packets with version
+// 0x01, so the subscriber tells them apart by the first byte.
 #pragma once
 
 #include <stddef.h>
@@ -21,11 +28,30 @@ constexpr uint16_t kDefaultPort = 12670;
 constexpr uint8_t kMagicSubscribe[4] = {'L', 'S', 'U', 'S'};
 constexpr uint8_t kMagicUnsubscribe[4] = {'L', 'S', 'U', 'U'};
 constexpr uint8_t kMagicStatus[4] = {'L', 'S', 'U', 'A'};
+constexpr uint8_t kMagicRequest[4] = {'L', 'S', 'U', 'R'};
+constexpr uint8_t kMagicRequestResult[4] = {'L', 'S', 'U', 'K'};
 
 constexpr size_t kSubscribeSize = 12;
 constexpr size_t kUnsubscribeSize = 4;
 constexpr size_t kStatusSize = 40;
 constexpr uint8_t kStatusVersion = 1;
+constexpr size_t kRequestSize = 6;
+constexpr size_t kRequestResultSize = 7;
+
+enum RequestResult : uint8_t {
+  kRequestSent = 0,           // queued for transmission on the bus
+  kRequestNotAllowed = 1,     // not in the whitelist (lsu_obd.h)
+  kRequestNotSubscribed = 2,  // only the current subscriber may request
+  kRequestBusy = 3,           // too soon after the previous request
+  kRequestTxDisabled = 4,     // firmware built listen-only (CAN_ACK=0)
+  kRequestTxFailed = 5,       // TWAI refused it (bus-off, TX queue full)
+};
+
+inline const char* requestResultName(uint8_t r) {
+  static const char* kNames[] = {"sent", "not allowed", "not subscribed",
+                                 "busy", "transmit disabled", "transmit failed"};
+  return r <= kRequestTxFailed ? kNames[r] : "?";
+}
 
 // Same values as twai_state_t.
 enum CanState : uint8_t { kCanStopped = 0, kCanRunning = 1, kCanBusOff = 2, kCanRecovering = 3 };
@@ -108,6 +134,35 @@ inline void encodeStatus(const Status& s, uint8_t* out) {
   put32(out + 28, s.rxMissed);
   put32(out + 32, s.rxOverrun);
   put32(out + 36, s.uptimeS);
+}
+
+inline void encodeRequest(uint8_t mode, uint8_t pid, uint8_t* out) {
+  memcpy(out, kMagicRequest, 4);
+  out[4] = mode;
+  out[5] = pid;
+}
+
+inline bool decodeRequest(const uint8_t* p, size_t n, uint8_t& mode, uint8_t& pid) {
+  if (n != kRequestSize || memcmp(p, kMagicRequest, 4) != 0) return false;
+  mode = p[4];
+  pid = p[5];
+  return true;
+}
+
+inline void encodeRequestResult(uint8_t mode, uint8_t pid, uint8_t result, uint8_t* out) {
+  memcpy(out, kMagicRequestResult, 4);
+  out[4] = mode;
+  out[5] = pid;
+  out[6] = result;
+}
+
+inline bool decodeRequestResult(const uint8_t* p, size_t n, uint8_t& mode, uint8_t& pid,
+                                uint8_t& result) {
+  if (n != kRequestResultSize || memcmp(p, kMagicRequestResult, 4) != 0) return false;
+  mode = p[4];
+  pid = p[5];
+  result = p[6];
+  return true;
 }
 
 inline bool isStatus(const uint8_t* p, size_t n) {

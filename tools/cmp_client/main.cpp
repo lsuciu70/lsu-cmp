@@ -3,17 +3,23 @@
 // All protocol work is in CmpSubscriber; this file only parses the command
 // line and prints the callbacks: each CAN frame, sequence gaps, the ESP32
 // status at subscription and whenever it changes (CAN state, bus errors,
-// drops, restarts), and idle periods.
+// drops, restarts), and idle periods. With --obd it also asks the ESP32
+// for OBD2 requests, in turn, and prints the decoded answers (ObdDecoder).
 //
 // Usage: cmp_client [host] [--port 12670] [--quiet]
+//                   [--obd MODE:PID[,MODE:PID...]] [--interval MS]
 
+#include <algorithm>
 #include <chrono>
 #include <csignal>
 #include <cstdio>
 #include <ctime>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "cmp_subscriber.h"
+#include "obd_decoder.h"
 
 namespace {
 
@@ -89,11 +95,31 @@ void printStatusChange(const lsu::Status* old, const lsu::Status& st) {
     printf("! ESP32 UDP send errors: +%u\n", st.sendErrors - old->sendErrors);
 }
 
+// "01:0C,09:02" -> {{0x01, 0x0C}, {0x09, 0x02}}. False on a syntax error.
+bool parseObdList(const std::string& s, std::vector<std::pair<uint8_t, uint8_t>>& out) {
+  size_t start = 0;
+  while (start <= s.size()) {
+    size_t end = s.find(',', start);
+    if (end == std::string::npos) end = s.size();
+    unsigned mode, pid;
+    char extra;
+    if (sscanf(s.substr(start, end - start).c_str(), "%x:%x%c", &mode, &pid, &extra) != 2 ||
+        mode > 0xFF || pid > 0xFF)
+      return false;
+    out.emplace_back(uint8_t(mode), uint8_t(pid));
+    start = end + 1;
+  }
+  return !out.empty();
+}
+
 void usage(const char* prog) {
-  fprintf(stderr, "Usage: %s [host] [--port N] [--quiet]\n"
-                  "  host     ESP32 IP (default 10.10.10.10, AP mode)\n"
-                  "  --port   UDP port (default %u)\n"
-                  "  --quiet  only a summary line every second\n",
+  fprintf(stderr, "Usage: %s [host] [--port N] [--quiet] [--obd LIST] [--interval MS]\n"
+                  "  host        ESP32 IP (default 10.10.10.10, AP mode)\n"
+                  "  --port      UDP port (default %u)\n"
+                  "  --quiet     only a summary line every second (and OBD2 answers)\n"
+                  "  --obd       OBD2 requests to send in turn, hex MODE:PID, comma\n"
+                  "              separated, e.g. 01:0C,01:0D,09:02 (modes 01 and 09)\n"
+                  "  --interval  ms between two requests (default 500, min 50)\n",
           prog, lsu::kDefaultPort);
 }
 
@@ -103,10 +129,19 @@ int main(int argc, char** argv) {
   std::string host = "10.10.10.10";
   uint16_t port = lsu::kDefaultPort;
   bool quiet = false;
+  std::vector<std::pair<uint8_t, uint8_t>> requests;
+  int intervalMs = 500;
   for (int i = 1; i < argc; i++) {
     std::string a = argv[i];
     if (a == "--port" && i + 1 < argc) {
       port = uint16_t(std::stoi(argv[++i]));
+    } else if (a == "--obd" && i + 1 < argc) {
+      if (!parseObdList(argv[++i], requests)) {
+        usage(argv[0]);
+        return 2;
+      }
+    } else if (a == "--interval" && i + 1 < argc) {
+      intervalMs = std::max(50, std::stoi(argv[++i]));
     } else if (a == "--quiet") {
       quiet = true;
     } else if (a == "-h" || a == "--help") {
@@ -125,11 +160,15 @@ int main(int argc, char** argv) {
   bool haveStatus = false;
   lsu::Status prevStatus{};
 
+  ObdDecoder obdDecoder;
+
   CmpSubscriber::Callbacks cb;
   cb.onFrame = [&](const cmp::DecodedCanPacket& p) {
     perSecond++;
     lastFrameMs = monoMs();
     if (!quiet) printFrame(p);
+    std::string answer = obdDecoder.feed(p.frame, p.dataLength);
+    if (!answer.empty()) printf("= %s\n", answer.c_str());
   };
   cb.onGap = [](unsigned lost) { printf("! sequence gap: %u packet(s) lost\n", lost); };
   cb.onStatus = [&](const lsu::Status& st) {
@@ -141,6 +180,12 @@ int main(int argc, char** argv) {
     printf("! no reply from ESP32 for 3 s: unreachable or not running\n");
   };
   cb.onReachable = [] { printf("ESP32 reachable again\n"); };
+  cb.onRequestResult = [&](uint8_t mode, uint8_t pid, uint8_t result) {
+    if (quiet && result == lsu::kRequestSent) return;
+    std::string name = ObdDecoder::pidName(mode, pid);
+    printf("> request %02X %02X%s%s: %s\n", mode, pid, name.empty() ? "" : " ",
+           name.c_str(), lsu::requestResultName(result));
+  };
   cb.onUnknownPacket = [](const uint8_t*, size_t size) {
     printf("? unexpected packet (%zu bytes)\n", size);
   };
@@ -159,10 +204,18 @@ int main(int argc, char** argv) {
 
   int64_t lastReport = monoMs();
   int64_t lastIdle = monoMs();
+  int64_t nextRequestMs = 0;
+  size_t nextRequest = 0;
   while (!stopRequested) {
-    sub.poll(100);
+    sub.poll(requests.empty() ? 100 : 10);
 
     int64_t now = monoMs();
+    // Requests only once subscribed: the ESP32 refuses them otherwise.
+    if (!requests.empty() && sub.hasStatus() && sub.reachable() && now >= nextRequestMs) {
+      sub.sendRequest(requests[nextRequest].first, requests[nextRequest].second);
+      nextRequest = (nextRequest + 1) % requests.size();
+      nextRequestMs = now + intervalMs;
+    }
     if (quiet && now - lastReport >= 1000) {
       const auto& c = sub.counters();
       printf("%llu frames/s, %llu total, %llu lost | CAN %s, bus errors %u\n",

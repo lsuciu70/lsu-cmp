@@ -1,12 +1,14 @@
 // ESP32-C3 CAN -> ASAM CMP UDP sender (SPEC.md).
 //
 // Tasks:
-//   capture  - TWAI receive only (ACKs unless CAN_ACK=0, config.h),
-//              timestamps frames, queues them
+//   capture  - TWAI receive (ACKs unless CAN_ACK=0, config.h), timestamps
+//              frames, queues them; sends the ISO-TP flow control for
+//              multi-frame OBD2 responses (lsu_obd.h)
 //              while a subscriber is active (SPEC.md §5.1)
 //   sender   - one CMP packet per CAN frame, UDP to the subscriber (§5.2)
-//   control  - receives SUBSCRIBE / UNSUBSCRIBE on the UDP port, replies
-//              STATUS to every SUBSCRIBE
+//   control  - receives SUBSCRIBE / UNSUBSCRIBE / REQUEST on the UDP port,
+//              replies STATUS / REQUEST_RESULT; puts whitelisted OBD2
+//              requests on the bus (SPEC.md §9)
 //   loop()   - LsuWifi web UI, ArduinoOTA, TCP log client and a periodic
 //              stats log (net_log.h: USB serial + TCP port kLogTcpPort)
 //
@@ -24,8 +26,11 @@
 #include <esp_timer.h>
 #include <lwip/sockets.h>
 
+#include <atomic>
+
 #include "cmp_encoder.h"
 #include "config.h"
+#include "lsu_obd.h"
 #include "lsu_protocol.h"
 #include "net_log.h"
 
@@ -60,6 +65,14 @@ volatile uint32_t statNoSubscriber = 0;
 volatile uint32_t statQueueFull = 0;
 volatile uint32_t statSent = 0;
 volatile uint32_t statSendErr = 0;
+volatile uint32_t statObdRequests = 0;
+volatile uint32_t statFlowControls = 0;
+volatile uint32_t statTxErr = 0;
+
+// esp_timer ms of the last OBD2 request put on the bus, 0 = none yet.
+std::atomic<uint32_t> lastRequestMs{0};
+
+uint32_t nowMs() { return uint32_t(esp_timer_get_time() / 1000); }
 
 Subscriber getSubscriber() {
   portENTER_CRITICAL(&subMux);
@@ -101,7 +114,7 @@ void startTwai() {
     return;
   }
   netLog.printf("[can] TWAI %s, %d kbit/s, RX GPIO%d\n",
-                CAN_ACK ? "normal (ACK, no transmit)" : "listen-only",
+                CAN_ACK ? "normal (ACK, OBD2 requests)" : "listen-only",
                 CAN_BITRATE_KBPS, kCanRxGpio);
 }
 
@@ -127,6 +140,50 @@ bool openSocket() {
   return true;
 }
 
+// Queues one standard 11-bit frame for transmission. Self reception puts
+// it into our own receive queue too, so it shows up in the CMP stream.
+// Single shot: no automatic retransmission, so a frame nobody ACKs (bus
+// asleep, ignition off) is not repeated back to back on the bus.
+bool transmit(uint32_t id, const uint8_t data[8]) {
+  twai_message_t m{};
+  m.identifier = id;
+  m.data_length_code = 8;
+  m.self = 1;
+  m.ss = 1;
+  memcpy(m.data, data, 8);
+  if (twai_transmit(&m, pdMS_TO_TICKS(10)) == ESP_OK) return true;
+  statTxErr++;
+  return false;
+}
+
+// Multi-frame OBD2 response to our request: tell the ECU to continue.
+void maybeSendFlowControl(const twai_message_t& msg) {
+  if (!CAN_ACK || !obd::isFirstFrame(msg.identifier, msg.extd, msg.data_length_code, msg.data))
+    return;
+  uint32_t last = lastRequestMs;
+  if (last == 0 || nowMs() - last > kFlowControlWindowMs) return;
+  uint8_t fc[8];
+  obd::buildFlowControl(fc);
+  if (transmit(obd::flowControlId(msg.identifier), fc)) statFlowControls++;
+}
+
+uint8_t handleRequest(const sockaddr_in& from, uint8_t mode, uint8_t pid) {
+  Subscriber s = getSubscriber();
+  if (!s.active || !sameAddr(s.addr, from)) return lsu::kRequestNotSubscribed;
+  if (!obd::isAllowedRequest(mode, pid)) return lsu::kRequestNotAllowed;
+  if (!CAN_ACK) return lsu::kRequestTxDisabled;
+  uint32_t now = nowMs();
+  uint32_t last = lastRequestMs;
+  if (last != 0 && now - last < kMinRequestIntervalMs) return lsu::kRequestBusy;
+  uint8_t data[8];
+  obd::buildRequest(mode, pid, data);
+  // Before transmit: the first frame of the answer may come back quickly.
+  lastRequestMs = now ? now : 1;
+  if (!transmit(obd::kFunctionalRequestId, data)) return lsu::kRequestTxFailed;
+  statObdRequests++;
+  return lsu::kRequestSent;
+}
+
 void captureTask(void*) {
   QueuedFrame q;
   twai_message_t msg;
@@ -134,6 +191,7 @@ void captureTask(void*) {
     if (twai_receive(&msg, portMAX_DELAY) != ESP_OK) continue;
     q.rxUs = esp_timer_get_time();
     statRx++;
+    maybeSendFlowControl(msg);
     if (!subscriberActive()) {
       statNoSubscriber++;
       continue;
@@ -209,7 +267,12 @@ void controlTask(void*) {
     char ip[16];
 
     uint64_t laptopNs;
-    if (n > 0 && lsu::decodeSubscribe(buf, n, laptopNs) && !otaInProgress) {
+    uint8_t mode, pid;
+    if (n > 0 && lsu::decodeRequest(buf, n, mode, pid)) {
+      uint8_t reply[lsu::kRequestResultSize];
+      lsu::encodeRequestResult(mode, pid, handleRequest(from, mode, pid), reply);
+      sendto(udpSocket, reply, sizeof(reply), 0, (sockaddr*)&from, sizeof(from));
+    } else if (n > 0 && lsu::decodeSubscribe(buf, n, laptopNs) && !otaInProgress) {
       portENTER_CRITICAL(&subMux);
       bool isNew = !subscriber.active || !sameAddr(subscriber.addr, from);
       subscriber.active = true;
@@ -246,12 +309,26 @@ void logStats() {
   if (sub.active) inet_ntoa_r(sub.addr.sin_addr, ip, sizeof(ip));
   netLog.printf(
       "[stats] can=%s rx=%lu no_sub=%lu q_full=%lu sent=%lu send_err=%lu | "
-      "twai missed=%lu overrun=%lu bus_err=%lu | sub=%s\n",
+      "twai missed=%lu overrun=%lu bus_err=%lu | obd req=%lu fc=%lu tx_err=%lu | "
+      "sub=%s\n",
       lsu::canStateName(st.canState), (unsigned long)st.canRx,
       (unsigned long)statNoSubscriber, (unsigned long)st.queueFull,
       (unsigned long)st.sent, (unsigned long)st.sendErrors,
       (unsigned long)st.rxMissed, (unsigned long)st.rxOverrun,
-      (unsigned long)st.busErrors, ip);
+      (unsigned long)st.busErrors, (unsigned long)statObdRequests,
+      (unsigned long)statFlowControls, (unsigned long)statTxErr, ip);
+}
+
+// Since we transmit, the controller can end up bus-off (e.g. requests with
+// no other node to ACK them). Recover, then restart once it has.
+void checkBusOff() {
+  twai_status_info_t st{};
+  if (twai_get_status_info(&st) != ESP_OK) return;
+  if (st.state == TWAI_STATE_BUS_OFF) {
+    if (twai_initiate_recovery() == ESP_OK) netLog.print("[can] bus-off, recovering\n");
+  } else if (st.state == TWAI_STATE_STOPPED) {
+    if (twai_start() == ESP_OK) netLog.print("[can] recovered, restarted\n");
+  }
 }
 
 void startOta() {
@@ -305,6 +382,11 @@ void loop() {
   if (millis() - lastStats >= kStatsIntervalMs) {
     lastStats = millis();
     logStats();
+  }
+  static uint32_t lastBusCheck = 0;
+  if (CAN_ACK && millis() - lastBusCheck >= 100) {
+    lastBusCheck = millis();
+    checkBusOff();
   }
   delay(2);
 }

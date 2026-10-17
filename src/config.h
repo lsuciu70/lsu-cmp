@@ -6,10 +6,11 @@
 #include "lsu_protocol.h"
 
 // --- CAN / TWAI (SPEC.md §2, §3) ---
-constexpr int kCanTxGpio = 1;  // WCMCU-230 CTX (ACK bits only, see CAN_ACK)
+constexpr int kCanTxGpio = 1;  // WCMCU-230 CTX (see CAN_ACK)
 constexpr int kCanRxGpio = 3;  // WCMCU-230 CRX
-// 1: TWAI normal mode. The firmware never queues a frame for transmission,
-//    but the controller ACKs every valid frame and sends error frames.
+// 1: TWAI normal mode. The controller ACKs every valid frame and sends
+//    error frames; the firmware transmits only OBD2 requests and their
+//    flow control (SPEC.md §9).
 //    Needed on the Golf 7 OBD2 bus: without any ACKing node the sender
 //    retransmits the same frame back to back (in-car test, 2026-10-17).
 // 0: listen-only, the node never drives the bus.
@@ -42,6 +43,14 @@ constexpr uint16_t kUdpPort = lsu::kDefaultPort;  // 12670
 // The PC resends SUBSCRIBE every second; without one for this long the
 // subscriber expires and sending stops.
 constexpr uint32_t kSubscriberTimeoutMs = 5000;
+
+// --- OBD2 requests (lsu_obd.h, SPEC.md §9) ---
+// A REQUEST arriving sooner than this after the previous one is refused
+// (busy). ECUs answer within 50 ms (ISO 15765-4 P2).
+constexpr uint32_t kMinRequestIntervalMs = 50;
+// A first frame on 0x7E8..0x7EF gets a flow control only this long after
+// our last request, so we never answer for another tester on the bus.
+constexpr uint32_t kFlowControlWindowMs = 1000;
 
 // --- OTA (ArduinoOTA, works in station and AP mode) ---
 // Optional password: build_flags = -DOTA_PASSWORD=\"...\"

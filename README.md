@@ -1,8 +1,10 @@
 # lsu-cmp
 
-ESP32-C3 firmware that listens to the CAN bus on the OBD2 connector (it
-transmits no frames, only ACKs; see `CAN_ACK` below) and sends every frame,
-wrapped in ASAM CMP, over UDP and WiFi to a laptop. Full specification: [SPEC.md](SPEC.md).
+ESP32-C3 firmware that listens to the CAN bus on the OBD2 connector and
+sends every frame, wrapped in ASAM CMP, over UDP and WiFi to a laptop. On
+the laptop's request it also puts standard OBD2 requests (modes 01 and 09)
+on the bus; it transmits nothing else, apart from ACKs (see `CAN_ACK`
+below). Full specification: [SPEC.md](SPEC.md).
 
 ## Hardware
 
@@ -15,8 +17,8 @@ wrapped in ASAM CMP, over UDP and WiFi to a laptop. Full specification: [SPEC.md
 - No 120 Ω termination on this node (the vehicle bus is already terminated).
 
 Pin-by-pin wiring: [SPEC.md §2](SPEC.md#2-hardware-confirmed-wired). The
-CAN GPIOs are in [src/config.h](src/config.h): TX = GPIO1 (CTX, carries
-only ACK bits and error frames), RX = GPIO3 (CRX).
+CAN GPIOs are in [src/config.h](src/config.h): TX = GPIO1 (CTX: ACKs,
+error frames, OBD2 requests), RX = GPIO3 (CRX).
 
 Things to keep in mind (not yet measured or verified):
 
@@ -37,13 +39,17 @@ Things to keep in mind (not yet measured or verified):
   ~500 ms, from ignition on until ~20 s after ignition (or engine) off, with
   0 losses and 0 bus errors, and nothing else, engine running or not. The
   OBD2 bus carries no vehicle data unless a tester requests it.
+  Third test (OBD2 requests, SPEC.md §9): the engine ECU answers on `0x7E8`
+  within 3–6 ms, the VIN arrives through the ISO-TP flow control, and live
+  values (rpm, boost, MAF, voltage, ...) follow the engine; 864 requests
+  with 0 transmit errors and 0 bus errors.
 
 ## Decisions (SPEC.md §6)
 
 | Decision | Choice |
 |---|---|
 | Toolchain | PlatformIO, Arduino framework; TWAI through ESP-IDF's `driver/twai.h` |
-| TWAI mode | normal, receive only (`CAN_ACK=1`): ACKs frames, never transmits one; `CAN_ACK=0` = listen-only |
+| TWAI mode | normal (`CAN_ACK=1`): ACKs frames, transmits only OBD2 requests and their flow control; `CAN_ACK=0` = listen-only, no requests |
 | deviceId / streamId | 1 / 1, chosen locally, **not** from an official ASAM registry |
 | UDP port | 12670, arbitrary, **not** an IANA-registered port for CMP |
 | Destination | subscription model: the laptop subscribes to the ESP32, which sends unicast to the subscriber |
@@ -63,6 +69,8 @@ C++ client: [lib/LsuProtocol/src/lsu_protocol.h](lib/LsuProtocol/src/lsu_protoco
 | SUBSCRIBE | laptop → ESP32 | `"LSUS"` + uint64 laptop time, ns since the Unix epoch (12 bytes) |
 | UNSUBSCRIBE | laptop → ESP32 | `"LSUU"` (4 bytes) |
 | STATUS | ESP32 → laptop | `"LSUA"` + version + CAN state and counters (40 bytes), reply to every SUBSCRIBE |
+| REQUEST | laptop → ESP32 | `"LSUR"` + OBD2 mode + PID (6 bytes): put one OBD2 request on the bus |
+| REQUEST_RESULT | ESP32 → laptop | `"LSUK"` + mode + PID + result (7 bytes), reply to every REQUEST |
 
 - The latest sender of a SUBSCRIBE becomes the only subscriber.
 - The laptop resends SUBSCRIBE every second. After 5 s without one the
@@ -76,6 +84,24 @@ C++ client: [lib/LsuProtocol/src/lsu_protocol.h](lib/LsuProtocol/src/lsu_protoco
   frames received, packets sent, frames dropped (full queues, overrun), UDP
   send errors, bus errors and uptime. This lets the client tell an
   unreachable ESP32 from a silent bus.
+
+## OBD2 requests (SPEC.md §9)
+
+- The ESP32 accepts a REQUEST only from the current subscriber, only for
+  mode 01 (current data) or 09 (vehicle information), at most one every
+  50 ms, and only when built with `CAN_ACK=1`. Anything else is refused
+  with a REQUEST_RESULT saying why; nothing goes on the bus.
+- It sends the request as a single frame on `0x7DF` (functional, all
+  emission ECUs): `02 <mode> <PID>`, padded to 8 bytes with `0x55`.
+- ECUs answer on `0x7E8`..`0x7EF`. For a multi-frame answer (e.g. the VIN)
+  the ESP32 sends the ISO-TP flow control to `0x7E0`..`0x7E7` itself, but
+  only within 1 s of its own request, so it never answers for another
+  tester.
+- The request and the flow control are transmitted single shot (no
+  automatic retransmission: a frame nobody ACKs, e.g. with the ignition
+  off, is not repeated on the bus) and with self reception (they appear in
+  the CMP stream next to the answers, with their real time).
+- After a bus-off the ESP32 recovers and restarts the controller by itself.
 
 ## CMP format
 
@@ -114,6 +140,13 @@ the internal queue.
    and every change (CAN state, bus errors, dropped frames, restart), "no
    reply from ESP32" after 3 s without STATUS, and a summary every 5 s while
    no CAN frames arrive.
+
+   OBD2: `--obd 01:0C,01:0D,09:02` sends these requests in turn (hex
+   MODE:PID), one every `--interval` ms (default 500). Answers are decoded
+   on lines starting with `=` (`= ECU 7E8  01 0C  engine speed = 800.5
+   rpm`), refused requests on lines starting with `>`. Decoded: supported
+   PIDs (01 00, 20, 40, ...), a dozen common mode 01 PIDs, VIN and ECU
+   name; anything else is shown in hex.
 4. Validation (SPEC.md §7): Wireshark on the same interface, *Decode As…*
    UDP port 12670 → ASAM CMP.
 
@@ -122,8 +155,9 @@ default; in AP mode `--port socket://10.10.10.10:23`), or
 `pio device monitor -e usb` over USB. A TCP client gets the last 4 KB of log
 on connect (including the boot messages); one TCP client at a time, no
 password. LsuWifi's own messages only go to USB. Every 5 s the log prints
-the statistics: frames received, dropped and sent, send errors and the TWAI
-counters (`bus_err`). If `bus_err` grows a lot, try 250 kbit/s:
+the statistics: frames received, dropped and sent, send errors, the TWAI
+counters (`bus_err`) and the OBD2 requests, flow controls and transmit
+errors. If `bus_err` grows a lot, try 250 kbit/s:
 `build_flags = -DCAN_BITRATE_KBPS=250`.
 
 ## Test client and base for later clients
@@ -132,16 +166,18 @@ counters (`bus_err`). If `bus_err` grows a lot, try 250 kbit/s:
 
 | File | Role |
 |---|---|
-| [cmp_subscriber.h](tools/cmp_client/cmp_subscriber.h) / `.cpp` | The reusable part: socket, periodic SUBSCRIBE, STATUS, sequence tracking, unreachable detection. No output, no threads; events through callbacks (`onFrame`, `onGap`, `onStatus`, `onUnreachable`, `onReachable`, `onUnknownPacket`). |
+| [cmp_subscriber.h](tools/cmp_client/cmp_subscriber.h) / `.cpp` | The reusable part: socket, periodic SUBSCRIBE, STATUS, sequence tracking, unreachable detection, `sendRequest()`. No output, no threads; events through callbacks (`onFrame`, `onGap`, `onStatus`, `onUnreachable`, `onReachable`, `onRequestResult`, `onUnknownPacket`). |
+| [obd_decoder.h](tools/cmp_client/obd_decoder.h) / `.cpp` | OBD2 answers from the CAN frames: ISO-TP reassembly per ECU, values for common PIDs. |
 | [main.cpp](tools/cmp_client/main.cpp) | The test client: command line and printing of the callbacks. |
 | [lib/CmpCodec](lib/CmpCodec/src/) | CMP encoder (firmware) and decoder (client), shared. |
 | [lib/LsuProtocol](lib/LsuProtocol/src/lsu_protocol.h) | The subscription protocol, shared. |
+| [lib/LsuObd](lib/LsuObd/src/lsu_obd.h) | OBD2 IDs, request whitelist, request and flow control frames, shared. |
 
 CMake builds the reusable part as the static library `cmp_subscriber`
 (CmpSubscriber + decoder), which `cmp_client` links against. A new client
 uses the same sources and writes its own `main`.
 
-Host tests (encoder, decoder, protocol): `pio test -e native`.
+Host tests (encoder, decoder, protocol, OBD2 frames): `pio test -e native`.
 
 ## Credits
 

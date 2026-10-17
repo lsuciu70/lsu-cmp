@@ -1,0 +1,6 @@
+{
+  "name": "LsuObd",
+  "version": "0.1.0",
+  "description": "OBD2 request whitelist and ISO-TP flow control for the lsu-cmp ESP32",
+  "platforms": "*"
+}

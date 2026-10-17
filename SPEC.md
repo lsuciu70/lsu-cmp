@@ -2,9 +2,9 @@
 
 ## 1. Purpose
 
-Firmware for the ESP32-C3 that passively reads the CAN bus on a vehicle's OBD2 connector (through the internal TWAI controller), wraps every received CAN frame in the ASAM CMP (Capture Module Protocol) format, and sends the packets over UDP and WiFi to a data sink (PC) on the local network.
+Firmware for the ESP32-C3 that reads the CAN bus on a vehicle's OBD2 connector (through the internal TWAI controller), wraps every received CAN frame in the ASAM CMP (Capture Module Protocol) format, and sends the packets over UDP and WiFi to a data sink (PC) on the local network.
 
-We transmit no frames on the CAN bus. By default the controller ACKs received frames (TWAI normal mode, see §3); listen-only remains available.
+On the CAN bus we transmit only what §9 allows: standard OBD2 read requests asked for by the laptop, and the ISO-TP flow control for their answers. By default the controller ACKs received frames (TWAI normal mode, see §3); listen-only remains available and then nothing is transmitted.
 
 ## 2. Hardware (confirmed, wired)
 
@@ -29,7 +29,7 @@ Target vehicle: VW Golf 7, 2017, 1.6 TDI (MQB platform, Gateway J533). OBD2 pins
 
 ## 3. TWAI configuration (ESP32-C3 internal CAN driver)
 
-- **Mode: normal, receive only** (`TWAI_MODE_NORMAL` in ESP-IDF, build flag `CAN_ACK=1`, the default). The firmware never queues a frame for transmission, but the controller ACKs every valid frame and sends error frames on errors. Originally listen-only (`TWAI_MODE_LISTEN_ONLY`, now `CAN_ACK=0`) was mandatory; the first in-car test (2026-10-17) showed why that is not enough on the Golf 7 OBD2 bus: with ignition on, one node sends ID `0x17F00010` (extended, data `20 10 00 00 00 00 00 00`), nobody ACKs it, so it is retransmitted back to back at 100% bus load. A listen-only node only ever sees that retransmission. With ACKs (second test, same day) the same frame comes once every ~500 ms and nothing else is on the bus, engine running or not. Normal mode is only safe at the correct bitrate: a wrong one makes this node send error frames on the live bus.
+- **Mode: normal** (`TWAI_MODE_NORMAL` in ESP-IDF, build flag `CAN_ACK=1`, the default). The firmware transmits only the frames of §9; the controller ACKs every valid frame and sends error frames on errors. Originally listen-only (`TWAI_MODE_LISTEN_ONLY`, now `CAN_ACK=0`) was mandatory; the first in-car test (2026-10-17) showed why that is not enough on the Golf 7 OBD2 bus: with ignition on, one node sends ID `0x17F00010` (extended, data `20 10 00 00 00 00 00 00`), nobody ACKs it, so it is retransmitted back to back at 100% bus load. A listen-only node only ever sees that retransmission. With ACKs (second test, same day) the same frame comes once every ~500 ms and nothing else is on the bus, engine running or not. Normal mode is only safe at the correct bitrate: a wrong one makes this node send error frames on the live bus.
 - **Baud rate: 500 kbit/s** as the first test (ISO 15765-4 standard for most post-2008 diagnostic buses). If massive bit/frame errors show up, try 250 kbit/s.
 - Classic CAN only (2.0A/B), no CAN-FD: neither the transceiver (SN65HVD230) nor the ESP32-C3 TWAI supports CAN-FD.
 - We accept both 11-bit and 29-bit IDs (open filter, no masking on reception, at least during the initial test/traffic exploration phase).
@@ -120,3 +120,19 @@ Wireshark has an official `asam-cmp` dissector: use it to confirm that the packe
 - The exact format of the CMP **Status/Control** messages (device discovery on the network): not verified, not needed for a simple data sender.
 - The exact computation of the CAN CRC for the payload's `crc` field: the ESP32 TWAI might not expose this value raw; to be checked during implementation and, if not available, explicitly documented in the code that 0/unsupported is sent, not an invented value.
 - ~~100% confirmation that the bus on pins 6/14 of the Golf 7 runs at 500 kbit/s~~ Confirmed by the in-car test of 2026-10-17: ~300,000 frames at 500 kbit/s, 0 bus errors while the bus was active.
+
+## 9. OBD2 requests
+
+The OBD2 bus of the target vehicle carries no vehicle data by itself (in-car tests of 2026-10-17, §3), so data has to be requested, as any OBD2 tester does. Decision: the laptop chooses what to request, the ESP32 checks it against a whitelist and transmits it. Definitions shared by firmware and tests: `lib/LsuObd/src/lsu_obd.h`.
+
+- **Protocol:** REQUEST `"LSUR"` + mode + PID from the laptop, REQUEST_RESULT `"LSUK"` + mode + PID + result from the ESP32 (`lsu_protocol.h`). Results: sent, not allowed, not subscribed, busy, transmit disabled, transmit failed.
+- **Whitelist:** SAE J1979 mode 01 (current data) and mode 09 (vehicle information), any PID. Both are read-only. Not allowed in this version: mode 03/07/0A (stored codes), mode 04 (clear codes), any UDS service.
+- **Who may request:** only the current subscriber; at most one request per 50 ms (`kMinRequestIntervalMs`); never with `CAN_ACK=0`.
+- **Frames (ISO 15765-4, 11-bit, 500 kbit/s):** request on `0x7DF` (functional), `02 <mode> <PID>` padded to DLC 8 with `0x55` (padding value arbitrary, receivers ignore it). Answers on `0x7E8 + n`.
+- **Multi-frame answers:** on a first frame from `0x7E8 + n` the ESP32 sends a flow control `30 00 00` (continue, no block limit, STmin 0) to `0x7E0 + n`, but only within 1 s of its own last request (`kFlowControlWindowMs`), so it never answers in place of another tester.
+- **Single shot:** requests and flow controls are transmitted without automatic retransmission. A frame nobody ACKs (bus asleep, ignition off) would otherwise be repeated back to back, as `0x17F00010` was in the first test. A lost request is simply not answered; the laptop asks again.
+- **Visibility:** requests and flow controls are transmitted with TWAI self reception, so they are also in the CMP stream, timestamped like any received frame.
+- **Bus-off:** now that we transmit, the controller can reach bus-off; the firmware then starts recovery and restarts the controller.
+- **Decoding** is on the laptop (`tools/cmp_client/obd_decoder.*`): ISO-TP reassembly per ECU, values for common mode 01 PIDs, VIN and ECU name.
+
+Verified in the car (2026-10-17): only the engine ECU answers (`0x7E8`), in 3–6 ms, padding its answers with `0xAA`. Supported mode 01 PIDs: 01 04 05 0B 0C 0D 0F 10 11 13 1C 1F 20 21 23 24 25 30 31 33 40 41 42 45 46 49 4A 4C 4F 60. The VIN (09 02) arrives as first frame + 2 consecutive frames after our flow control. With the laptop asking every 100 ms, about 30% of the requests were refused as busy: WiFi jitter brings some REQUESTs closer than 50 ms.

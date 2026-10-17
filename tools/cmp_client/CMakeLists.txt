@@ -20,7 +20,8 @@ target_include_directories(cmp_subscriber PUBLIC
   ${FIRMWARE_LIB_DIR}/LsuProtocol/src)
 target_compile_options(cmp_subscriber PRIVATE -Wall -Wextra)
 
-# Test client.
-add_executable(cmp_client main.cpp)
+# Test client, with the OBD2 response decoder.
+add_executable(cmp_client main.cpp obd_decoder.cpp)
+target_include_directories(cmp_client PRIVATE ${FIRMWARE_LIB_DIR}/LsuObd/src)
 target_link_libraries(cmp_client PRIVATE cmp_subscriber)
 target_compile_options(cmp_client PRIVATE -Wall -Wextra)

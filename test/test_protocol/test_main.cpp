@@ -48,6 +48,32 @@ void test_status_not_confused_with_cmp() {
   TEST_ASSERT_FALSE(lsu::isStatus(cmpStart, sizeof(cmpStart)));
 }
 
+void test_request_round_trip() {
+  uint8_t buf[lsu::kRequestSize];
+  lsu::encodeRequest(0x01, 0x0C, buf);
+  const uint8_t expected[] = {'L', 'S', 'U', 'R', 0x01, 0x0C};
+  TEST_ASSERT_EQUAL_HEX8_ARRAY(expected, buf, sizeof(expected));
+  uint8_t mode = 0, pid = 0;
+  TEST_ASSERT_TRUE(lsu::decodeRequest(buf, sizeof(buf), mode, pid));
+  TEST_ASSERT_EQUAL_HEX8(0x01, mode);
+  TEST_ASSERT_EQUAL_HEX8(0x0C, pid);
+  TEST_ASSERT_FALSE(lsu::decodeRequest(buf, sizeof(buf) - 1, mode, pid));
+  TEST_ASSERT_FALSE(lsu::decodeRequest(lsu::kMagicSubscribe, 4, mode, pid));
+}
+
+void test_request_result_round_trip() {
+  uint8_t buf[lsu::kRequestResultSize];
+  lsu::encodeRequestResult(0x09, 0x02, lsu::kRequestBusy, buf);
+  const uint8_t expected[] = {'L', 'S', 'U', 'K', 0x09, 0x02, 3};
+  TEST_ASSERT_EQUAL_HEX8_ARRAY(expected, buf, sizeof(expected));
+  uint8_t mode = 0, pid = 0, result = 0;
+  TEST_ASSERT_TRUE(lsu::decodeRequestResult(buf, sizeof(buf), mode, pid, result));
+  TEST_ASSERT_EQUAL_HEX8(0x09, mode);
+  TEST_ASSERT_EQUAL_HEX8(0x02, pid);
+  TEST_ASSERT_EQUAL_STRING("busy", lsu::requestResultName(result));
+  TEST_ASSERT_FALSE(lsu::isStatus(buf, sizeof(buf)));
+}
+
 }  // namespace
 
 int main() {
@@ -56,5 +82,7 @@ int main() {
   RUN_TEST(test_unsubscribe);
   RUN_TEST(test_status_round_trip);
   RUN_TEST(test_status_not_confused_with_cmp);
+  RUN_TEST(test_request_round_trip);
+  RUN_TEST(test_request_result_round_trip);
   return UNITY_END();
 }

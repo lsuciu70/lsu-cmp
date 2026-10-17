@@ -6,6 +6,7 @@
 //   CmpSubscriber sub(callbacks);
 //   if (!sub.open("192.168.100.240", lsu::kDefaultPort, &err)) ...
 //   while (running) sub.poll(100);
+//   sub.sendRequest(0x01, 0x0C);  // optional: OBD2 request, see below
 //   sub.close();  // sends UNSUBSCRIBE (also done by the destructor)
 //
 // poll() does all the work in the calling thread: it resends SUBSCRIBE
@@ -35,7 +36,9 @@ class CmpSubscriber {
     // answers), and the first STATUS after that.
     std::function<void()> onUnreachable;
     std::function<void()> onReachable;
-    // Neither a CMP CAN packet nor a valid STATUS.
+    // REQUEST_RESULT: the ESP32's answer to sendRequest().
+    std::function<void(uint8_t mode, uint8_t pid, uint8_t result)> onRequestResult;
+    // Neither a CMP CAN packet nor a valid STATUS or REQUEST_RESULT.
     std::function<void(const uint8_t* data, size_t size)> onUnknownPacket;
   };
 
@@ -61,6 +64,10 @@ class CmpSubscriber {
   bool open(const std::string& host, uint16_t port, std::string* error = nullptr);
   bool poll(int timeoutMs);  // false if not open
   void close();              // sends UNSUBSCRIBE, closes the socket
+  // Asks the ESP32 to put one OBD2 request (lsu_obd.h) on the bus. The
+  // outcome comes in onRequestResult, the request and the ECU answers as
+  // CAN frames in onFrame. False if not open or the send failed.
+  bool sendRequest(uint8_t mode, uint8_t pid);
 
   int fd() const { return _sock; }
   bool reachable() const { return _reachable; }

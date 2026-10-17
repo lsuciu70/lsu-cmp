@@ -83,6 +83,13 @@ bool CmpSubscriber::poll(int timeoutMs) {
   return true;
 }
 
+bool CmpSubscriber::sendRequest(uint8_t mode, uint8_t pid) {
+  if (_sock < 0) return false;
+  uint8_t msg[lsu::kRequestSize];
+  lsu::encodeRequest(mode, pid, msg);
+  return send(_sock, msg, sizeof(msg), 0) == ssize_t(sizeof(msg));
+}
+
 void CmpSubscriber::sendSubscribe(int64_t nowMs) {
   uint8_t msg[lsu::kSubscribeSize];
   lsu::encodeSubscribe(unixNs(), msg);
@@ -102,6 +109,11 @@ void CmpSubscriber::receive() {
 }
 
 void CmpSubscriber::handlePacket(const uint8_t* data, size_t size) {
+  uint8_t mode, pid, result;
+  if (lsu::decodeRequestResult(data, size, mode, pid, result)) {
+    if (_cb.onRequestResult) _cb.onRequestResult(mode, pid, result);
+    return;
+  }
   if (lsu::isStatus(data, size)) {
     lsu::Status st;
     if (!lsu::decodeStatus(data, size, st)) {
