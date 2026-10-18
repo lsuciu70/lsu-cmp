@@ -53,7 +53,7 @@ Things to keep in mind (not yet measured or verified):
 | deviceId / streamId | 1 / 1, chosen locally, **not** from an official ASAM registry |
 | UDP ports | 12670 (data: CMP only) and 12671 (control: own protocol), arbitrary, **not** IANA-registered |
 | Destination | subscription model: the laptop subscribes to the ESP32, which sends unicast to the subscriber |
-| WiFi | [LsuWifi](README-WIFI.md) library; default AP `lsu-cmp` / `12345678` at `10.10.10.10` |
+| WiFi | [LsuWifi](README-WIFI.md) library v0.2.0: saved networks in priority order, follows network changes; default AP `lsu-cmp` / `12345678` at `10.10.10.10` |
 | interfaceId | 0, arbitrary, a single physical CAN channel |
 | Timestamp | laptop time, sent in every SUBSCRIBE |
 
@@ -145,6 +145,14 @@ the internal queue.
    reservation 192.168.100.240). Where no saved network is in range it
    starts the `lsu-cmp` AP. Connect the laptop to it; more networks can be
    added at `http://10.10.10.10` (see [README-WIFI.md](README-WIFI.md)).
+
+   In the car: save the phone hotspot on the board's `/wifi` page and move
+   it to priority 1. Then the board picks the hotspot when it is on, and
+   switches by itself when its network goes away (about 20 s after the
+   loss: e.g. hotspot off at home -> back to the router, driving away from
+   home -> hotspot). The laptop, on the same hotspot, reaches the board by
+   name: `cmp_client lsu-cmp.local` (mDNS, announced by ArduinoOTA; once,
+   the name did not resolve on the first try). Tested 2026-10-18.
 3. On the laptop, the C++ test client (Linux):
    ```
    cmake -S tools/cmp_client -B tools/cmp_client/build && cmake --build tools/cmp_client/build
@@ -206,7 +214,9 @@ Log: `pio device monitor` over WiFi (TCP port 23, 192.168.100.240 by
 default; in AP mode `--port socket://10.10.10.10:23`), or
 `pio device monitor -e usb` over USB. A TCP client gets the last 4 KB of log
 on connect (including the boot messages); one TCP client at a time, no
-password. LsuWifi's own messages only go to USB. Every 5 s the log prints
+password. LsuWifi's own messages only go to USB; the firmware reports each
+network change on the TCP log too (`[net] lost '...'`, `[net] connected to
+'...', IP ...`). Every 5 s the log prints
 the statistics: frames received, dropped and sent, send errors, the TWAI
 counters (`bus_err`) and the OBD2 requests, flow controls and transmit
 errors. If `bus_err` grows a lot, try 250 kbit/s:

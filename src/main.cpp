@@ -339,6 +339,25 @@ void checkBusOff() {
   }
 }
 
+// LsuWifi follows the board between networks (e.g. home router -> phone
+// hotspot) but logs only to USB; report each change on the TCP log too.
+void logNetworkChanges() {
+  static bool wasAp = false, wasConnected = false;
+  static IPAddress lastIp;
+  bool ap = LsuWifi.isApMode(), connected = LsuWifi.isConnected();
+  IPAddress ip = LsuWifi.ip();
+  if (ap == wasAp && connected == wasConnected && ip == lastIp) return;
+  if (ap)
+    netLog.printf("[net] AP mode, IP %s\n", ip.toString().c_str());
+  else if (connected)
+    netLog.printf("[net] connected to '%s', IP %s\n", LsuWifi.ssid().c_str(), ip.toString().c_str());
+  else
+    netLog.printf("[net] lost '%s'\n", LsuWifi.ssid().c_str());
+  wasAp = ap;
+  wasConnected = connected;
+  lastIp = ip;
+}
+
 void startOta() {
   ArduinoOTA.setHostname(kOtaHostname);
 #ifdef OTA_PASSWORD
@@ -384,6 +403,7 @@ void setup() {
 
 void loop() {
   LsuWifi.loop();
+  logNetworkChanges();
   ArduinoOTA.handle();
   netLog.loop();
   static uint32_t lastStats = 0;

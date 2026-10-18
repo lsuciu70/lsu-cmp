@@ -5,7 +5,19 @@ project and the board can be moved to a new place and reconnected from a phone,
 without reflashing.
 
 - At boot it scans, then tries the saved external networks that are in range,
-  strongest signal first, each up to 3 times (10 s per attempt).
+  in **priority order** (their order in the list; an "Up" button on the web
+  page moves a network up), each up to 3 times (10 s per attempt). Until
+  v0.2.0 the strongest signal won instead.
+- After boot it follows the board when it moves (e.g. in a car, from the
+  home network to a phone hotspot):
+  - connection lost for 20 s (`LSUWIFI_RESCAN_AFTER_MS`): it scans again and
+    tries the saved networks in range, in priority order, else starts the AP;
+  - in AP mode, every 60 s (`LSUWIFI_AP_RESCAN_MS`): if a saved network is
+    in range it leaves the AP and connects. Skipped while a client is on
+    the AP, so a phone configuring the board is not disturbed.
+  - while connected it stays on its network, even if one with a higher
+    priority comes into range.
+  - Set either interval to 0 to disable that check.
 - If none connects (or none is saved) it starts its own access point:
   - IP `10.10.10.10`
   - SSID `lsu-esp32`, password `12345678`
@@ -34,12 +46,12 @@ without reflashing.
 
 ```ini
 lib_deps =
-    git+ssh://git@github.com/lsuciu70/lsu-esp32-wifi.git#v0.1.1
+    git+ssh://git@github.com/lsuciu70/lsu-esp32-wifi.git#v0.2.0
 ```
 
 The repo is private, so the SSH URL is used (it relies on the machine's
 GitHub SSH key). The plain `https://` URL only works if the repo is made
-public. `#v0.1.1` pins a release tag; drop it to follow `main`. While
+public. `#v0.2.0` pins a release tag; drop it to follow `main`. While
 changing the library and a project together, use the local checkout instead:
 edits are picked up on the next build, with no push needed.
 
