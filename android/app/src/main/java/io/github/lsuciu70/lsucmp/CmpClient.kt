@@ -43,6 +43,8 @@ class CmpClient(private val scope: CoroutineScope) {
         val error: String? = null,
         /** Connection events, oldest first, "HH:mm:ss  text". */
         val log: List<String> = emptyList(),
+        /** An ECU answered within the last CAR_SILENT_MS (ignition on). */
+        val carAnswering: Boolean = false,
     )
 
     private val _state = MutableStateFlow(State())
@@ -99,6 +101,7 @@ class CmpClient(private val scope: CoroutineScope) {
         var nextWatch = 0L
         var nextRequest = 0L
         var lastStatus = System.currentTimeMillis()
+        var lastAnswer = 0L
         var expectedSeq = -1
 
         fun send(data: ByteArray, to: InetAddress) =
@@ -129,6 +132,10 @@ class CmpClient(private val scope: CoroutineScope) {
                     if (phase != _state.value.phase)
                         log(if (esp == null) "searching for the board again" else "no answer from the board")
                     _state.update { it.copy(phase = phase) }
+                }
+                if (_state.value.carAnswering && now - lastAnswer >= CAR_SILENT_MS) {
+                    _state.update { it.copy(carAnswering = false) }
+                    log("car silent (ignition off?)")
                 }
 
                 try {
@@ -189,6 +196,13 @@ class CmpClient(private val scope: CoroutineScope) {
                     if (lost >= 0x8000) lost = 0
                     expectedSeq = (pkt.sequenceCounter + 1) and 0xFFFF
                     val answer = decoder.feed(pkt.frame)
+                    if (answer != null) {
+                        lastAnswer = System.currentTimeMillis()
+                        if (!_state.value.carAnswering) {
+                            _state.update { it.copy(carAnswering = true) }
+                            log("car answering (ignition on)")
+                        }
+                    }
                     if (lost > 0) log("$lost packet(s) lost")
                     if (answer != null && answer.mode == Obd.MODE_VEHICLE_INFO &&
                         pending.remove(answer.mode to answer.pid)
@@ -213,6 +227,7 @@ class CmpClient(private val scope: CoroutineScope) {
 
     private companion object {
         const val LOG_LINES = 200
+        const val CAR_SILENT_MS = 3000L
     }
 
     /** Broadcast address of every IPv4 network the phone is on. */

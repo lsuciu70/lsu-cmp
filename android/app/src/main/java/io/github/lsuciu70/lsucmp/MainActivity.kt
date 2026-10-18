@@ -1,6 +1,6 @@
 // Two screens. Connect: board address (blank = search), connect button,
-// status and event log. Once the board has answered, the dashboard, which
-// fits on one screen:
+// status and event log. Once the car has answered (first OBD2 value, e.g.
+// the VIN), the dashboard, which fits on one screen:
 //   - engine speed as the one hero figure, inside an arc gauge, with the
 //     vehicle speed beside it;
 //   - six tiles (value + meter bar) for the other watched PIDs;
@@ -73,7 +73,7 @@ val DASHBOARD = listOf(
     0x01 to 0x0B,  // intake manifold pressure (boost)
     0x01 to 0x05,  // coolant
     0x01 to 0x42,  // voltage
-    0x01 to 0x11,  // throttle
+    0x01 to 0x49,  // accelerator pedal (0x11 is the intake throttle valve on a diesel)
     0x01 to 0x10,  // MAF
     0x01 to 0x04,  // load
 )
@@ -119,7 +119,7 @@ private val TILES = listOf(
             else -> null
         }
     }),
-    Gauge(0x11, "throttle", "%", 0.0, 100.0, 0),
+    Gauge(0x49, "accelerator pedal", "%", 0.0, 100.0, 0),
     Gauge(0x10, "MAF", "g/s", 0.0, 150.0, 1),
     Gauge(0x04, "engine load", "%", 0.0, 100.0, 0),
 )
@@ -145,8 +145,9 @@ class MainActivity : ComponentActivity() {
                     if (active) window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
                     else window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
                 }
-                // The dashboard from the board's first answer until disconnect.
-                if (active && state.status != null) Dashboard(vm, state) else ConnectScreen(vm, state, active)
+                // The dashboard from the car's first answer (any OBD2 value,
+                // e.g. the VIN) until disconnect.
+                if (active && state.values.isNotEmpty()) Dashboard(vm, state) else ConnectScreen(vm, state, active)
             }
         }
     }
@@ -357,10 +358,12 @@ private fun statusLine(s: CmpClient.State): String = when (s.phase) {
     CmpClient.Phase.IDLE -> s.error?.let { "Error: $it" } ?: "Not connected"
     CmpClient.Phase.SEARCHING -> "Searching for the board…"
     CmpClient.Phase.UNREACHABLE -> "No answer from ${s.esp ?: "the board"}"
-    CmpClient.Phase.CONNECTED -> buildString {
+    CmpClient.Phase.CONNECTED -> if (s.values.isEmpty()) "board ${s.esp} connected · waiting for the car (ignition on?)"
+    else buildString {
         append("${s.esp} · ${s.frames} frames · ${s.lost} lost")
         // Only worth a word when it is not the normal state.
         s.status?.let { if (it.canStateName != "running") append(" · CAN ${it.canStateName}") }
+        if (!s.carAnswering) append(" · car silent")
         if (s.refused > 0) append(" · ${s.refused} refused")
     }
 }

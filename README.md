@@ -272,10 +272,12 @@ pcap reader and writer: `ctest --test-dir tools/cmp_client/build`.
 
 [android/](android/) (Kotlin, Jetpack Compose, Android 10+; tested on a
 Galaxy S23 Ultra with Android 16). Two screens: a connect screen (board IP,
-Connect, status and event log), and from the board's first answer a
-dashboard that fits on one screen: engine speed on an arc gauge (red zone
+Connect, status and event log; "waiting for the car" while the board
+answers but no ECU does), and from the car's first answer (any OBD2 value,
+e.g. the VIN) a dashboard that fits on one screen: engine speed on an arc gauge (red zone
 from 4500 rpm) with the vehicle speed and VIN beside it, six tiles with a
-meter bar (manifold pressure, coolant, voltage, throttle, MAF, load), and
+meter bar (manifold pressure, coolant, voltage, accelerator pedal, MAF,
+load), and
 at the bottom Disconnect, a status line and the event log. Warning colors
 appear only out of range and always with a word (HIGH, HOT, LOW). It speaks the same protocol
 as `cmp_client` ([Protocol.kt](android/app/src/main/java/io/github/lsuciu70/lsucmp/Protocol.kt),
@@ -292,7 +294,12 @@ board to poll those PIDs (WATCH) and requests the VIN until it arrives.
   --loop` on the laptop; the app finds it the same way.
 - Values older than 3 s are dimmed; the screen stays on while connected.
 - The event log records searching, the board found, connected, board
-  restarted, no answer, CAN bus errors, refused requests and the VIN.
+  restarted, no answer, car answering (ignition on) / car silent for 3 s
+  (ignition off?), CAN bus errors, refused requests and the VIN.
+- Accelerator pedal is PID `01 49`: on this diesel `01 11` is the intake
+  throttle valve, which stays at 83-89 % whatever the pedal does. Pedal
+  sensors usually do not span 0-100 %; the real range on the Golf is still
+  to be seen in the car.
 
 Build and install (Android SDK in `~/Android/Sdk`, USB debugging on):
 

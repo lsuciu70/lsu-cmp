@@ -31,6 +31,8 @@ constexpr PidFormula kMode01[] = {
     {0x33, "barometric pressure", 1, 1, 0, "kPa"},
     {0x42, "control module voltage", 2, 0.001, 0, "V"},
     {0x46, "ambient air temperature", 1, 1, -40, "°C"},
+    {0x49, "accelerator pedal D", 1, 100.0 / 255, 0, "%"},
+    {0x4A, "accelerator pedal E", 1, 100.0 / 255, 0, "%"},
     {0x5C, "engine oil temperature", 1, 1, -40, "°C"},
 };
 

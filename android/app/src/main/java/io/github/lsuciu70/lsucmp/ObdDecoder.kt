@@ -44,6 +44,8 @@ object Obd {
         0x33 to Formula("barometric pressure", 1, 1.0, 0.0, "kPa"),
         0x42 to Formula("control module voltage", 2, 0.001, 0.0, "V"),
         0x46 to Formula("ambient air temperature", 1, 1.0, -40.0, "°C"),
+        0x49 to Formula("accelerator pedal D", 1, 100.0 / 255, 0.0, "%"),
+        0x4A to Formula("accelerator pedal E", 1, 100.0 / 255, 0.0, "%"),
         0x5C to Formula("engine oil temperature", 1, 1.0, -40.0, "°C"),
     )
 
