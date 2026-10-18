@@ -14,9 +14,10 @@
 //              stats log (net_log.h: USB serial + TCP port kLogTcpPort)
 //
 // Subscription protocol (own, not part of ASAM CMP): lsu_protocol.h.
-// The sender of the latest SUBSCRIBE becomes the only subscriber, and the
-// clock offset is reset from its time on every SUBSCRIBE. CMP timestamps are
-// therefore laptop time, accurate to about the WiFi latency (a few ms; no
+// Up to kMaxSubscribers clients at once; each gets every CMP packet, with
+// its own sequence counter, and timestamps in its own clock: the offset is
+// reset from the client's time on each of its SUBSCRIBEs, so CMP timestamps
+// are that client's time, accurate to about the WiFi latency (a few ms; no
 // latency compensation). Nothing is sent without a subscriber, so every
 // packet sent carries the insync flag.
 
@@ -44,6 +45,7 @@ struct QueuedFrame {
 
 struct Subscriber {
   bool active = false;
+  uint32_t id = 0;  // new for each subscription: the sender restarts its sequence
   sockaddr_in addr{};
   int64_t offsetNs = 0;  // laptop time - esp_timer time
   int64_t lastSeenUs = 0;
@@ -56,9 +58,12 @@ int dataSocket = -1;     // sends CMP from kDataPort
 int controlSocket = -1;  // SUBSCRIBE / REQUEST in, STATUS / REQUEST_RESULT out
 
 portMUX_TYPE subMux = portMUX_INITIALIZER_UNLOCKED;
-Subscriber subscriber;  // guarded by subMux
+Subscriber subscribers[kMaxSubscribers];  // guarded by subMux
+uint32_t nextSubscriberId = 1;           // guarded by subMux
 
-volatile bool overflowPending = false;  // frames dropped since last packet
+// Frames dropped since boot: each subscriber's next packet gets the overflow
+// flag when this changed since its previous one.
+std::atomic<uint32_t> dropCount{0};
 volatile bool otaInProgress = false;    // streaming paused during an update
 
 // Counters for the stats log.
@@ -76,22 +81,36 @@ std::atomic<uint32_t> lastRequestMs{0};
 
 uint32_t nowMs() { return uint32_t(esp_timer_get_time() / 1000); }
 
-Subscriber getSubscriber() {
-  portENTER_CRITICAL(&subMux);
-  Subscriber s = subscriber;
-  portEXIT_CRITICAL(&subMux);
-  return s;
-}
-
-bool subscriberActive() {
-  portENTER_CRITICAL(&subMux);
-  bool active = subscriber.active;
-  portEXIT_CRITICAL(&subMux);
-  return active;
-}
-
 bool sameAddr(const sockaddr_in& a, const sockaddr_in& b) {
   return a.sin_addr.s_addr == b.sin_addr.s_addr && a.sin_port == b.sin_port;
+}
+
+void getSubscribers(Subscriber out[kMaxSubscribers]) {
+  portENTER_CRITICAL(&subMux);
+  for (int i = 0; i < kMaxSubscribers; i++) out[i] = subscribers[i];
+  portEXIT_CRITICAL(&subMux);
+}
+
+bool anySubscriber() {
+  bool any = false;
+  portENTER_CRITICAL(&subMux);
+  for (int i = 0; i < kMaxSubscribers && !any; i++) any = subscribers[i].active;
+  portEXIT_CRITICAL(&subMux);
+  return any;
+}
+
+// Slot of the active subscriber at `addr`, or -1. Call inside subMux.
+int findSubscriber(const sockaddr_in& addr) {
+  for (int i = 0; i < kMaxSubscribers; i++)
+    if (subscribers[i].active && sameAddr(subscribers[i].addr, addr)) return i;
+  return -1;
+}
+
+bool isSubscriber(const sockaddr_in& addr) {
+  portENTER_CRITICAL(&subMux);
+  bool found = findSubscriber(addr) >= 0;
+  portEXIT_CRITICAL(&subMux);
+  return found;
 }
 
 void startTwai() {
@@ -176,8 +195,7 @@ void maybeSendFlowControl(const twai_message_t& msg) {
 }
 
 uint8_t handleRequest(const sockaddr_in& from, uint8_t mode, uint8_t pid) {
-  Subscriber s = getSubscriber();
-  if (!s.active || !sameAddr(s.addr, from)) return lsu::kRequestNotSubscribed;
+  if (!isSubscriber(from)) return lsu::kRequestNotSubscribed;
   if (!obd::isAllowedRequest(mode, pid)) return lsu::kRequestNotAllowed;
   if (!CAN_ACK) return lsu::kRequestTxDisabled;
   uint32_t now = nowMs();
@@ -200,7 +218,7 @@ void captureTask(void*) {
     q.rxUs = esp_timer_get_time();
     statRx++;
     maybeSendFlowControl(msg);
-    if (!subscriberActive()) {
+    if (!anySubscriber()) {
       statNoSubscriber++;
       continue;
     }
@@ -211,33 +229,47 @@ void captureTask(void*) {
     memcpy(q.frame.data, msg.data, sizeof(q.frame.data));
     if (xQueueSend(frameQueue, &q, 0) != pdTRUE) {
       statQueueFull++;
-      overflowPending = true;
+      dropCount++;
     }
   }
 }
 
 void senderTask(void*) {
+  // Per slot, owned by this task: which subscription it is serving, its
+  // next sequence number and the drop count its last packet reflected.
+  struct Stream {
+    uint32_t id = 0;
+    uint16_t sequence = 0;
+    uint32_t drops = 0;
+  };
+  Stream streams[kMaxSubscribers];
+  Subscriber subs[kMaxSubscribers];
   QueuedFrame q;
   uint8_t packet[cmp::kMaxPacketSize];
-  uint16_t sequenceCounter = 0;
   for (;;) {
     if (xQueueReceive(frameQueue, &q, portMAX_DELAY) != pdTRUE) continue;
-    Subscriber s = getSubscriber();
-    if (!s.active) continue;
+    getSubscribers(subs);
+    uint32_t drops = dropCount;
+    for (int i = 0; i < kMaxSubscribers; i++) {
+      if (!subs[i].active) continue;
+      Stream& st = streams[i];
+      if (st.id != subs[i].id) {  // new subscriber in this slot
+        st.id = subs[i].id;
+        st.sequence = 0;
+        st.drops = drops;
+      }
 
-    uint8_t flags = cmp::kFlagInsync;
-    if (overflowPending) {
-      overflowPending = false;
-      flags |= cmp::kFlagOverflow;
-    }
-    uint64_t ts = (uint64_t)(q.rxUs * 1000 + s.offsetNs);
-    size_t len = cmp::encodeCanPacket(kStream, sequenceCounter++, ts, flags,
-                                      q.frame, packet);
-    if (sendto(dataSocket, packet, len, 0, (sockaddr*)&s.addr,
-               sizeof(s.addr)) == (int)len) {
-      statSent++;
-    } else {
-      statSendErr++;  // shows as a sequenceCounter gap on the PC
+      uint8_t flags = cmp::kFlagInsync;
+      if (st.drops != drops) flags |= cmp::kFlagOverflow;
+      st.drops = drops;
+      uint64_t ts = (uint64_t)(q.rxUs * 1000 + subs[i].offsetNs);
+      size_t len = cmp::encodeCanPacket(kStream, st.sequence++, ts, flags, q.frame, packet);
+      if (sendto(dataSocket, packet, len, 0, (sockaddr*)&subs[i].addr,
+                 sizeof(subs[i].addr)) == (int)len) {
+        statSent++;
+      } else {
+        statSendErr++;  // shows as a sequenceCounter gap on that client
+      }
     }
   }
 }
@@ -282,39 +314,68 @@ void controlTask(void*) {
       sendto(controlSocket, reply, sizeof(reply), 0, (sockaddr*)&from, sizeof(from));
     } else if (n > 0 && lsu::decodeSubscribe(buf, n, laptopNs) && !otaInProgress) {
       portENTER_CRITICAL(&subMux);
-      bool isNew = !subscriber.active || !sameAddr(subscriber.addr, from);
-      subscriber.active = true;
-      subscriber.addr = from;
-      subscriber.offsetNs = (int64_t)laptopNs - nowUs * 1000;
-      subscriber.lastSeenUs = nowUs;
-      portEXIT_CRITICAL(&subMux);
-      if (isNew) {
-        inet_ntoa_r(from.sin_addr, ip, sizeof(ip));
-        netLog.printf("[sub] subscriber %s:%u\n", ip, ntohs(from.sin_port));
+      int slot = findSubscriber(from);
+      bool isNew = slot < 0;
+      for (int i = 0; i < kMaxSubscribers && slot < 0; i++)
+        if (!subscribers[i].active) slot = i;
+      if (slot >= 0) {
+        Subscriber& s = subscribers[slot];
+        if (isNew) {
+          s.active = true;
+          s.id = nextSubscriberId++;
+          s.addr = from;
+        }
+        s.offsetNs = (int64_t)laptopNs - nowUs * 1000;
+        s.lastSeenUs = nowUs;
       }
-      sendStatus(from);
+      portEXIT_CRITICAL(&subMux);
+      inet_ntoa_r(from.sin_addr, ip, sizeof(ip));
+      if (slot < 0) {
+        netLog.printf("[sub] %s:%u ignored, all %d slots taken\n", ip, ntohs(from.sin_port),
+                      kMaxSubscribers);
+      } else {
+        if (isNew) netLog.printf("[sub] subscriber %s:%u\n", ip, ntohs(from.sin_port));
+        sendStatus(from);
+      }
     } else if (n > 0 && lsu::isUnsubscribe(buf, n)) {
       portENTER_CRITICAL(&subMux);
-      bool removed = subscriber.active && sameAddr(subscriber.addr, from);
-      if (removed) subscriber.active = false;
+      int slot = findSubscriber(from);
+      if (slot >= 0) subscribers[slot].active = false;
       portEXIT_CRITICAL(&subMux);
-      if (removed) netLog.print("[sub] unsubscribed\n");
+      if (slot >= 0) {
+        inet_ntoa_r(from.sin_addr, ip, sizeof(ip));
+        netLog.printf("[sub] %s:%u unsubscribed\n", ip, ntohs(from.sin_port));
+      }
     }
 
-    portENTER_CRITICAL(&subMux);
-    bool expired = subscriber.active &&
-                   nowUs - subscriber.lastSeenUs > (int64_t)kSubscriberTimeoutMs * 1000;
-    if (expired) subscriber.active = false;
-    portEXIT_CRITICAL(&subMux);
-    if (expired) netLog.print("[sub] subscriber timed out\n");
+    for (int i = 0; i < kMaxSubscribers; i++) {
+      portENTER_CRITICAL(&subMux);
+      Subscriber& s = subscribers[i];
+      bool expired = s.active && nowUs - s.lastSeenUs > (int64_t)kSubscriberTimeoutMs * 1000;
+      if (expired) s.active = false;
+      sockaddr_in addr = s.addr;
+      portEXIT_CRITICAL(&subMux);
+      if (expired) {
+        inet_ntoa_r(addr.sin_addr, ip, sizeof(ip));
+        netLog.printf("[sub] %s:%u timed out\n", ip, ntohs(addr.sin_port));
+      }
+    }
   }
 }
 
 void logStats() {
   lsu::Status st = currentStatus();
-  Subscriber sub = getSubscriber();
-  char ip[16] = "-";
-  if (sub.active) inet_ntoa_r(sub.addr.sin_addr, ip, sizeof(ip));
+  Subscriber subs[kMaxSubscribers];
+  getSubscribers(subs);
+  char list[kMaxSubscribers * 16 + 1] = "";
+  for (int i = 0; i < kMaxSubscribers; i++) {
+    if (!subs[i].active) continue;
+    char ip[16];
+    inet_ntoa_r(subs[i].addr.sin_addr, ip, sizeof(ip));
+    if (list[0]) strcat(list, ",");
+    strcat(list, ip);
+  }
+  const char* ip = list[0] ? list : "-";
   netLog.printf(
       "[stats] can=%s rx=%lu no_sub=%lu q_full=%lu sent=%lu send_err=%lu | "
       "twai missed=%lu overrun=%lu bus_err=%lu | obd req=%lu fc=%lu tx_err=%lu | "
@@ -364,11 +425,11 @@ void startOta() {
   ArduinoOTA.setPassword(OTA_PASSWORD);
 #endif
   ArduinoOTA.onStart([] {
-    // Free the WiFi link for the upload: drop the subscriber and ignore new
+    // Free the WiFi link for the upload: drop the subscribers and ignore new
     // SUBSCRIBEs until the board restarts.
     otaInProgress = true;
     portENTER_CRITICAL(&subMux);
-    subscriber.active = false;
+    for (Subscriber& s : subscribers) s.active = false;
     portEXIT_CRITICAL(&subMux);
     netLog.print("[ota] update started, streaming stopped\n");
   });

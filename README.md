@@ -52,7 +52,7 @@ Things to keep in mind (not yet measured or verified):
 | TWAI mode | normal (`CAN_ACK=1`): ACKs frames, transmits only OBD2 requests and their flow control; `CAN_ACK=0` = listen-only, no requests |
 | deviceId / streamId | 1 / 1, chosen locally, **not** from an official ASAM registry |
 | UDP ports | 12670 (data: CMP only) and 12671 (control: own protocol), arbitrary, **not** IANA-registered |
-| Destination | subscription model: the laptop subscribes to the ESP32, which sends unicast to the subscriber |
+| Destination | subscription model: clients subscribe to the ESP32, which sends unicast to each subscriber (up to 4 at once) |
 | WiFi | [LsuWifi](README-WIFI.md) library v0.2.0: saved networks in priority order, follows network changes; default AP `lsu-cmp` / `12345678` at `10.10.10.10` |
 | interfaceId | 0, arbitrary, a single physical CAN channel |
 | Timestamp | laptop time, sent in every SUBSCRIBE |
@@ -76,7 +76,12 @@ as malformed CMP packets.
 | REQUEST | laptop → ESP32 | `"LSUR"` + OBD2 mode + PID (6 bytes): put one OBD2 request on the bus |
 | REQUEST_RESULT | ESP32 → laptop | `"LSUK"` + mode + PID + result (7 bytes), reply to every REQUEST |
 
-- The latest sender of a SUBSCRIBE becomes the only subscriber.
+- Up to 4 subscribers at once (`kMaxSubscribers`), e.g. the phone app and
+  a laptop recording; each one gets every CMP packet, with its own
+  sequence counter and timestamps in its own clock. A SUBSCRIBE from a new
+  client is ignored while all slots are taken (logged on the board).
+  Until 2026-10-18 the latest sender of a SUBSCRIBE became the only
+  subscriber, so two clients took the stream away from each other.
 - The laptop resends SUBSCRIBE every second. After 5 s without one the
   subscriber expires and the ESP32 stops sending.
 - On every SUBSCRIBE the ESP32 recomputes its clock offset. The CMP timestamp

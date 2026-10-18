@@ -43,8 +43,12 @@ constexpr uint16_t kControlPort = lsu::kControlPort;  // 12671
 
 // --- Subscription protocol (own protocol, not part of ASAM CMP) ---
 // The PC resends SUBSCRIBE every second; without one for this long the
-// subscriber expires and sending stops.
+// subscriber expires and sending to it stops.
 constexpr uint32_t kSubscriberTimeoutMs = 5000;
+// Clients served at once (e.g. the phone app and a laptop recording); each
+// gets every CMP packet. A SUBSCRIBE from a new client is ignored while all
+// slots are taken.
+constexpr int kMaxSubscribers = 4;
 
 // --- OBD2 requests (lsu_obd.h, SPEC.md §9) ---
 // A REQUEST arriving sooner than this after the previous one is refused
