@@ -75,6 +75,7 @@ as malformed CMP packets.
 | STATUS | ESP32 → laptop | `"LSUA"` + version + CAN state and counters (40 bytes), reply to every SUBSCRIBE |
 | REQUEST | laptop → ESP32 | `"LSUR"` + OBD2 mode + PID (6 bytes): put one OBD2 request on the bus |
 | REQUEST_RESULT | ESP32 → laptop | `"LSUK"` + mode + PID + result (7 bytes), reply to every REQUEST |
+| WATCH | laptop → ESP32 | `"LSUW"` + count + count × (mode, PID), up to 16: the mode 01 PIDs to poll for this client; resent every 4 s, replaces the previous list, no reply |
 
 - Up to 4 subscribers at once (`kMaxSubscribers`), e.g. the phone app and
   a laptop recording; each one gets every CMP packet, with its own
@@ -101,13 +102,23 @@ as malformed CMP packets.
   mode 01 (current data) or 09 (vehicle information), and only when built
   with `CAN_ACK=1`. Anything else is refused with a REQUEST_RESULT saying
   why; nothing goes on the bus.
-- Accepted requests wait in a queue of 8 and go on the bus one every
-  20 ms, for all subscribers together. A request already waiting is not
-  queued twice (its answer reaches every subscriber). Only a full queue
-  refuses a request as busy. REQUEST_RESULT "sent" means accepted; a
-  transmit error later only shows in the board's stats (`tx_err`).
-  Without the queue, WiFi delivering several REQUESTs at once got about a
-  third of the phone app's requests refused.
+- **Live values: WATCH.** A client says once every 4 s which mode 01 PIDs
+  it wants; the board polls the union of all clients' lists itself, round
+  robin, one request every 20 ms (each of 8 PIDs about every 0.16 s), and
+  every answer reaches every subscriber. A client's list is dropped 10 s
+  after its last WATCH. Only the WATCH crosses the WiFi, so the rate on
+  the bus is steady whatever the clients' WiFi does.
+- **One-off values: REQUEST** (e.g. the VIN, `09 02`). Accepted requests
+  wait in a queue of 8 and go before the watched PIDs. A request already
+  waiting is not queued twice; only a full queue refuses as busy.
+  REQUEST_RESULT "sent" means accepted; a transmit error later only shows
+  in the board's stats (`tx_err`).
+- **ECUs silent** (no answer for 2 s, e.g. ignition off): the board polls
+  one watched PID per second instead of 50, and goes back to full rate at
+  the first answer.
+- History: until 2026-10-18 clients sent every request themselves; WiFi
+  delivered them in bunches, and refusing the bunched ones (no queue) or
+  queueing them still left values stalling now and then.
 - It sends the request as a single frame on `0x7DF` (functional, all
   emission ECUs): `02 <mode> <PID>`, padded to 8 bytes with `0xAA`, as the
   engine ECU pads its answers.
@@ -178,8 +189,9 @@ the internal queue.
    reply from ESP32" after 3 s without STATUS, and a summary every 5 s while
    no CAN frames arrive.
 
-   OBD2: `--obd 01:0C,01:0D,09:02` sends these requests in turn (hex
-   MODE:PID), one every `--interval` ms (default 500). Answers are decoded
+   OBD2: `--obd 01:0C,01:0D,09:02` (hex MODE:PID): the mode 01 PIDs go to
+   the board as WATCH (renewed every 4 s), the others as REQUEST at the
+   same pace. Answers are decoded
    on lines starting with `=` (`= ECU 7E8  01 0C  engine speed = 800.5
    rpm`), refused requests on lines starting with `>`. Decoded: supported
    PIDs (01 00, 20, 40, ...), a dozen common mode 01 PIDs, VIN and ECU
@@ -264,8 +276,8 @@ tiles for engine speed, vehicle speed, intake manifold pressure, coolant,
 voltage, throttle, MAF and load, plus the VIN. It speaks the same protocol
 as `cmp_client` ([Protocol.kt](android/app/src/main/java/io/github/lsuciu70/lsucmp/Protocol.kt),
 [ObdDecoder.kt](android/app/src/main/java/io/github/lsuciu70/lsucmp/ObdDecoder.kt),
-ports of the C++ sources, with the same golden-byte tests) and requests
-those PIDs in turn every 60 ms (each value about every 0.5 s).
+ports of the C++ sources, with the same golden-byte tests). It asks the
+board to poll those PIDs (WATCH) and requests the VIN until it arrives.
 
 - **Finding the board:** with the IP field blank, SUBSCRIBE goes out as a
   broadcast on every network the phone is on; the board's STATUS reply

@@ -7,10 +7,11 @@
 //              responses (lsu_obd.h)
 //   sender   - one CMP packet per CAN frame, UDP from the data port to the
 //              subscriber (§5.2)
-//   control  - receives SUBSCRIBE / UNSUBSCRIBE / REQUEST on the control
-//              port, replies STATUS / REQUEST_RESULT; queues whitelisted
-//              OBD2 requests (SPEC.md §9)
-//   requests - puts the queued OBD2 requests on the bus, spaced out
+//   control  - receives SUBSCRIBE / UNSUBSCRIBE / REQUEST / WATCH on the
+//              control port, replies STATUS / REQUEST_RESULT; queues
+//              one-off OBD2 requests, keeps each client's watched PIDs
+//   requests - every 20 ms puts one OBD2 request on the bus: a queued
+//              one-off, else the next watched PID (SPEC.md §9)
 //   loop()   - LsuWifi web UI, ArduinoOTA, TCP log client and a periodic
 //              stats log (net_log.h: USB serial + TCP port kLogTcpPort)
 //
@@ -50,6 +51,10 @@ struct Subscriber {
   sockaddr_in addr{};
   int64_t offsetNs = 0;  // laptop time - esp_timer time
   int64_t lastSeenUs = 0;
+  // Mode 01 PIDs this client wants polled (its last WATCH).
+  lsu::WatchEntry watch[lsu::kMaxWatch];
+  int watchCount = 0;
+  int64_t watchSeenUs = 0;
 };
 
 const cmp::StreamConfig kStream = {kCmpDeviceId, kCmpStreamId, kCmpInterfaceId};
@@ -78,15 +83,17 @@ volatile uint32_t statFlowControls = 0;
 volatile uint32_t statTxErr = 0;
 volatile uint32_t statObdBusy = 0;
 
-// Accepted OBD2 requests waiting for the bus (ring buffer, guarded by
-// requestMux); requestTask sends them.
-struct ObdRequest {
-  uint8_t mode, pid;
-};
+// One-off OBD2 requests waiting for the bus (ring buffer, guarded by
+// requestMux); requestTask sends them before the watched PIDs.
+using ObdRequest = lsu::WatchEntry;
 portMUX_TYPE requestMux = portMUX_INITIALIZER_UNLOCKED;
 ObdRequest requestQueue[kRequestQueueLen];
 int requestHead = 0, requestCount = 0;
-TaskHandle_t requestTaskHandle = nullptr;
+
+// esp_timer ms of the last frame from an ECU (0x7E8..0x7EF), 0 = none yet.
+std::atomic<uint32_t> lastAnswerMs{0};
+volatile int statWatched = 0;     // PIDs in the watched list
+volatile bool statSlowPoll = true;
 
 // esp_timer ms of the last OBD2 request put on the bus, 0 = none yet.
 std::atomic<uint32_t> lastRequestMs{0};
@@ -221,7 +228,6 @@ bool queueRequest(uint8_t mode, uint8_t pid) {
     requestCount++;
   }
   portEXIT_CRITICAL(&requestMux);
-  if (ok) xTaskNotifyGive(requestTaskHandle);
   return ok;
 }
 
@@ -248,21 +254,83 @@ uint8_t handleRequest(const sockaddr_in& from, uint8_t mode, uint8_t pid) {
   return lsu::kRequestSent;
 }
 
-// Puts the queued requests on the bus, kMinRequestIntervalMs apart.
-void requestTask(void*) {
-  ObdRequest r;
-  for (;;) {
-    if (!popRequest(r)) {
-      ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-      continue;
+// A client's WATCH replaces its list of polled PIDs (mode 01 only; the
+// rest is dropped). Ignored from a client that is not subscribed.
+void handleWatch(const sockaddr_in& from, const lsu::WatchEntry* entries, int count) {
+  lsu::WatchEntry kept[lsu::kMaxWatch];
+  int n = 0;
+  for (int i = 0; i < count; i++)
+    if (entries[i].mode == obd::kModeCurrentData && obd::isAllowedRequest(entries[i].mode, entries[i].pid))
+      kept[n++] = entries[i];
+  portENTER_CRITICAL(&subMux);
+  int slot = findSubscriber(from);
+  bool changed = false;
+  if (slot >= 0) {
+    Subscriber& s = subscribers[slot];
+    changed = s.watchCount != n || memcmp(s.watch, kept, sizeof(kept[0]) * n) != 0;
+    memcpy(s.watch, kept, sizeof(kept[0]) * n);
+    s.watchCount = n;
+    s.watchSeenUs = esp_timer_get_time();
+  }
+  portEXIT_CRITICAL(&subMux);
+  if (changed) {
+    char ip[16];
+    inet_ntoa_r(from.sin_addr, ip, sizeof(ip));
+    netLog.printf("[obd] %s:%u watches %d PID(s)\n", ip, ntohs(from.sin_port), n);
+  }
+}
+
+// Union of the watched PIDs of all subscribers whose WATCH is recent
+// enough; returns its size.
+int watchedPids(ObdRequest out[]) {
+  int64_t nowUs = esp_timer_get_time();
+  int n = 0;
+  portENTER_CRITICAL(&subMux);
+  for (const Subscriber& s : subscribers) {
+    if (!s.active || nowUs - s.watchSeenUs > (int64_t)lsu::kWatchTimeoutMs * 1000) continue;
+    for (int i = 0; i < s.watchCount; i++) {
+      bool dup = false;
+      for (int k = 0; k < n && !dup; k++) dup = out[k].mode == s.watch[i].mode && out[k].pid == s.watch[i].pid;
+      if (!dup) out[n++] = s.watch[i];
     }
-    uint8_t data[8];
-    obd::buildRequest(r.mode, r.pid, data);
-    // Before transmit: the first frame of the answer may come back quickly.
-    uint32_t now = nowMs();
-    lastRequestMs = now ? now : 1;
-    if (transmit(obd::kFunctionalRequestId, data)) statObdRequests++;
+  }
+  portEXIT_CRITICAL(&subMux);
+  return n;
+}
+
+void sendRequest(const ObdRequest& r) {
+  uint8_t data[8];
+  obd::buildRequest(r.mode, r.pid, data);
+  // Before transmit: the first frame of the answer may come back quickly.
+  uint32_t now = nowMs();
+  lastRequestMs = now ? now : 1;
+  if (transmit(obd::kFunctionalRequestId, data)) statObdRequests++;
+}
+
+// Every kMinRequestIntervalMs: a queued one-off request if any, otherwise
+// the next watched PID (slowly while the ECUs are silent).
+void requestTask(void*) {
+  ObdRequest watched[kMaxSubscribers * lsu::kMaxWatch];
+  int next = 0;
+  uint32_t lastPollMs = 0;
+  for (;;) {
     vTaskDelay(pdMS_TO_TICKS(kMinRequestIntervalMs));
+    uint32_t now = nowMs();
+    uint32_t answer = lastAnswerMs;
+    bool slow = answer == 0 || now - answer > kEcuSilentMs;
+    int n = watchedPids(watched);
+    if (n > 0 && slow != statSlowPoll)
+      netLog.printf(slow ? "[obd] no answers, polling slowly\n" : "[obd] answers, polling at full rate\n");
+    statSlowPoll = slow;
+    statWatched = n;
+
+    ObdRequest r;
+    if (popRequest(r)) {
+      sendRequest(r);
+    } else if (n > 0 && (!slow || now - lastPollMs >= kSlowPollMs)) {
+      sendRequest(watched[next++ % n]);
+      lastPollMs = now;
+    }
   }
 }
 
@@ -273,6 +341,7 @@ void captureTask(void*) {
     if (twai_receive(&msg, portMAX_DELAY) != ESP_OK) continue;
     q.rxUs = esp_timer_get_time();
     statRx++;
+    if (obd::isResponseId(msg.identifier, msg.extd)) lastAnswerMs = nowMs() | 1;
     maybeSendFlowControl(msg);
     if (!anySubscriber()) {
       statNoSubscriber++;
@@ -364,7 +433,11 @@ void controlTask(void*) {
 
     uint64_t laptopNs;
     uint8_t mode, pid;
-    if (n > 0 && lsu::decodeRequest(buf, n, mode, pid)) {
+    lsu::WatchEntry watch[lsu::kMaxWatch];
+    int watchCount;
+    if (n > 0 && lsu::decodeWatch(buf, n, watch, watchCount)) {
+      handleWatch(from, watch, watchCount);
+    } else if (n > 0 && lsu::decodeRequest(buf, n, mode, pid)) {
       uint8_t reply[lsu::kRequestResultSize];
       lsu::encodeRequestResult(mode, pid, handleRequest(from, mode, pid), reply);
       sendto(controlSocket, reply, sizeof(reply), 0, (sockaddr*)&from, sizeof(from));
@@ -380,6 +453,7 @@ void controlTask(void*) {
           s.active = true;
           s.id = nextSubscriberId++;
           s.addr = from;
+          s.watchCount = 0;
         }
         s.offsetNs = (int64_t)laptopNs - nowUs * 1000;
         s.lastSeenUs = nowUs;
@@ -434,14 +508,16 @@ void logStats() {
   const char* ip = list[0] ? list : "-";
   netLog.printf(
       "[stats] can=%s rx=%lu no_sub=%lu q_full=%lu sent=%lu send_err=%lu | "
-      "twai missed=%lu overrun=%lu bus_err=%lu | obd req=%lu busy=%lu fc=%lu tx_err=%lu | "
+      "twai missed=%lu overrun=%lu bus_err=%lu | obd req=%lu busy=%lu fc=%lu tx_err=%lu "
+      "watch=%d%s | "
       "sub=%s\n",
       lsu::canStateName(st.canState), (unsigned long)st.canRx,
       (unsigned long)statNoSubscriber, (unsigned long)st.queueFull,
       (unsigned long)st.sent, (unsigned long)st.sendErrors,
       (unsigned long)st.rxMissed, (unsigned long)st.rxOverrun,
       (unsigned long)st.busErrors, (unsigned long)statObdRequests, (unsigned long)statObdBusy,
-      (unsigned long)statFlowControls, (unsigned long)statTxErr, ip);
+      (unsigned long)statFlowControls, (unsigned long)statTxErr, statWatched,
+      statWatched ? (statSlowPoll ? " slow" : " fast") : "", ip);
 }
 
 // Since we transmit, the controller can end up bus-off (e.g. requests with
@@ -515,7 +591,7 @@ void setup() {
   if (!openSockets()) return;
   xTaskCreate(captureTask, "capture", 3072, nullptr, 5, nullptr);
   xTaskCreate(senderTask, "sender", 4096, nullptr, 4, nullptr);
-  xTaskCreate(requestTask, "requests", 3072, nullptr, 4, &requestTaskHandle);
+  xTaskCreate(requestTask, "requests", 3072, nullptr, 4, nullptr);
   xTaskCreate(controlTask, "control", 4096, nullptr, 3, nullptr);
 }
 

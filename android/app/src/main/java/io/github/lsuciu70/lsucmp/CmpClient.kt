@@ -1,6 +1,7 @@
 // Talks to the lsu-cmp ESP32 the way tools/cmp_client does: resends
-// SUBSCRIBE every second, asks for OBD2 requests in turn, and decodes the
-// CMP stream into OBD2 values. Publishes everything as one StateFlow.
+// SUBSCRIBE every second and WATCH (the PIDs the board polls for us) every
+// 4 s, asks for one-off values (VIN) until they arrive, and decodes the CMP
+// stream into OBD2 values. Publishes everything as one StateFlow.
 //
 // Finding the board: with no host given, SUBSCRIBE goes out as a broadcast
 // on every local network (e.g. the phone's hotspot, where the board's IP is
@@ -48,15 +49,16 @@ class CmpClient(private val scope: CoroutineScope) {
 
     /**
      * Starts talking to [host] (an IP or name), or searches the local
-     * networks when it is blank. [requests] are (mode, pid) pairs sent in
-     * turn every [intervalMs]; mode 09 requests stop once answered.
+     * networks when it is blank. [watch]: mode 01 (mode, pid) pairs the
+     * board polls as fast as the bus allows. [oneOff]: requested every 2 s
+     * until answered (e.g. the VIN).
      */
-    fun start(host: String, requests: List<Pair<Int, Int>>, intervalMs: Long) {
+    fun start(host: String, watch: List<Pair<Int, Int>>, oneOff: List<Pair<Int, Int>>) {
         stop()
         _state.value = State(phase = Phase.SEARCHING)
         job = scope.launch(Dispatchers.IO) {
             try {
-                run(host.trim(), requests, intervalMs)
+                run(host.trim(), watch, oneOff)
             } catch (e: Exception) {
                 _state.update { it.copy(phase = Phase.IDLE, error = e.message ?: e.toString()) }
             }
@@ -69,7 +71,7 @@ class CmpClient(private val scope: CoroutineScope) {
         _state.update { it.copy(phase = Phase.IDLE) }
     }
 
-    private suspend fun run(host: String, requests: List<Pair<Int, Int>>, intervalMs: Long) {
+    private suspend fun run(host: String, watch: List<Pair<Int, Int>>, oneOff: List<Pair<Int, Int>>) {
         val fixed: InetAddress? = if (host.isEmpty()) null else InetAddress.getByName(host)
         var esp: InetAddress? = fixed
         val socket = DatagramSocket(null).apply {
@@ -79,12 +81,12 @@ class CmpClient(private val scope: CoroutineScope) {
             bind(InetSocketAddress(0))
         }
         val decoder = ObdDecoder()
-        val pending = requests.toMutableList()
+        val pending = oneOff.toMutableList()
         val buf = ByteArray(2048)
         val packet = DatagramPacket(buf, buf.size)
         var nextSubscribe = 0L
+        var nextWatch = 0L
         var nextRequest = 0L
-        var requestIndex = 0
         var lastStatus = System.currentTimeMillis()
         var expectedSeq = -1
 
@@ -101,11 +103,13 @@ class CmpClient(private val scope: CoroutineScope) {
                     nextSubscribe = now + 1000
                 }
                 val reachable = esp != null && now - lastStatus < 3000
+                if (reachable && watch.isNotEmpty() && now >= nextWatch) {
+                    send(Lsu.watch(watch), esp!!)
+                    nextWatch = now + Lsu.WATCH_RENEW_MS
+                }
                 if (reachable && pending.isNotEmpty() && now >= nextRequest) {
-                    requestIndex %= pending.size
-                    val (mode, pid) = pending[requestIndex++]
-                    send(Lsu.request(mode, pid), esp!!)
-                    nextRequest = now + intervalMs
+                    pending.forEach { (mode, pid) -> send(Lsu.request(mode, pid), esp!!) }
+                    nextRequest = now + 2000
                 }
                 if (esp != null && now - lastStatus >= 3000) {
                     // Searching again lets a board that got a new IP be found.
@@ -135,7 +139,10 @@ class CmpClient(private val scope: CoroutineScope) {
                     // Uptime going back: the board restarted. Start the
                     // counters over, so its restart does not show as losses.
                     val restarted = _state.value.status?.let { st.uptimeS < it.uptimeS } == true
-                    if (restarted) expectedSeq = -1
+                    if (restarted) {
+                        expectedSeq = -1
+                        nextWatch = 0  // the restarted board knows nothing of our list
+                    }
                     _state.update {
                         val base = if (restarted) it.copy(frames = 0, lost = 0, refused = 0, lastRefusal = null) else it
                         base.copy(phase = Phase.CONNECTED, esp = from.hostAddress, status = st, error = null)
@@ -144,7 +151,10 @@ class CmpClient(private val scope: CoroutineScope) {
                 Lsu.decodeRequestResult(buf, n)?.let { r ->
                     // The board forgot us (restart, or no SUBSCRIBE for 5 s):
                     // subscribe again now instead of at the next second.
-                    if (r.result == Lsu.REQUEST_NOT_SUBSCRIBED) nextSubscribe = 0
+                    if (r.result == Lsu.REQUEST_NOT_SUBSCRIBED) {
+                        nextSubscribe = 0
+                        nextWatch = 0
+                    }
                     if (r.result != Lsu.REQUEST_SENT) _state.update {
                         it.copy(
                             refused = it.refused + 1,

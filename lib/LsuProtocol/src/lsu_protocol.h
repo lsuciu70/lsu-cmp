@@ -9,6 +9,15 @@
 //                                 request on the bus (lsu_obd.h, SPEC.md §9)
 //   ESP32 -> laptop  REQUEST_RESULT  "LSUK" + mode + PID + RequestResult,
 //                                 reply to every REQUEST
+//   laptop -> ESP32  WATCH        "LSUW" + count + count x (mode, PID): the
+//                                 mode 01 PIDs this client wants polled;
+//                                 resent every kWatchRenewMs, replaces the
+//                                 client's previous list, no reply
+//
+// REQUEST is for one-off requests (e.g. the VIN). For live values a client
+// sends WATCH instead: the ESP32 polls the union of all clients' lists on
+// the bus itself, at its own steady rate, and drops a client's list
+// kWatchTimeoutMs after its last WATCH (SPEC.md §9).
 //
 // The answers of the ECUs, and the request itself, arrive as ordinary CAN
 // frames in the CMP stream.
@@ -35,6 +44,7 @@ constexpr uint8_t kMagicUnsubscribe[4] = {'L', 'S', 'U', 'U'};
 constexpr uint8_t kMagicStatus[4] = {'L', 'S', 'U', 'A'};
 constexpr uint8_t kMagicRequest[4] = {'L', 'S', 'U', 'R'};
 constexpr uint8_t kMagicRequestResult[4] = {'L', 'S', 'U', 'K'};
+constexpr uint8_t kMagicWatch[4] = {'L', 'S', 'U', 'W'};
 
 constexpr size_t kSubscribeSize = 12;
 constexpr size_t kUnsubscribeSize = 4;
@@ -42,6 +52,10 @@ constexpr size_t kStatusSize = 40;
 constexpr uint8_t kStatusVersion = 1;
 constexpr size_t kRequestSize = 6;
 constexpr size_t kRequestResultSize = 7;
+constexpr int kMaxWatch = 16;                        // (mode, PID) pairs per WATCH
+constexpr size_t kWatchMaxSize = 5 + 2 * kMaxWatch;  // 37
+constexpr uint32_t kWatchRenewMs = 4000;             // client resends WATCH
+constexpr uint32_t kWatchTimeoutMs = 10000;          // ESP32 drops the list
 
 enum RequestResult : uint8_t {
   kRequestSent = 0,           // accepted: queued for the bus (or already queued)
@@ -167,6 +181,31 @@ inline bool decodeRequestResult(const uint8_t* p, size_t n, uint8_t& mode, uint8
   mode = p[4];
   pid = p[5];
   result = p[6];
+  return true;
+}
+
+struct WatchEntry {
+  uint8_t mode, pid;
+};
+
+// Writes WATCH for up to kMaxWatch entries; returns its size.
+inline size_t encodeWatch(const WatchEntry* entries, int count, uint8_t* out) {
+  if (count > kMaxWatch) count = kMaxWatch;
+  memcpy(out, kMagicWatch, 4);
+  out[4] = uint8_t(count);
+  for (int i = 0; i < count; i++) {
+    out[5 + 2 * i] = entries[i].mode;
+    out[6 + 2 * i] = entries[i].pid;
+  }
+  return 5 + 2 * size_t(count);
+}
+
+// Reads WATCH into out[kMaxWatch]; false if malformed.
+inline bool decodeWatch(const uint8_t* p, size_t n, WatchEntry* out, int& count) {
+  if (n < 5 || memcmp(p, kMagicWatch, 4) != 0) return false;
+  count = p[4];
+  if (count > kMaxWatch || n != 5 + 2 * size_t(count)) return false;
+  for (int i = 0; i < count; i++) out[i] = {p[5 + 2 * i], p[6 + 2 * i]};
   return true;
 }
 

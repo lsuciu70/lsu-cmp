@@ -73,6 +73,10 @@ class CmpSubscriber {
   // outcome comes in onRequestResult, the request and the ECU answers as
   // CAN frames in onFrame. False if not open or the send failed.
   bool sendRequest(uint8_t mode, uint8_t pid);
+  // Tells the ESP32 which mode 01 PIDs to poll for this client (replaces
+  // the previous list; empty stops). Must be resent every lsu::kWatchRenewMs,
+  // the ESP32 drops the list lsu::kWatchTimeoutMs after the last one.
+  bool sendWatch(const lsu::WatchEntry* entries, int count);
 
   // IPv4 address (host byte order) and port this socket receives on, and
   // the ESP32's address. False if not open.

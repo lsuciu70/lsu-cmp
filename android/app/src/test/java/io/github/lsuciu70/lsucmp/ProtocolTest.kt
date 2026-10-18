@@ -74,6 +74,12 @@ class ProtocolTest {
         )
         assertArrayEquals("LSUU".toByteArray(), Lsu.unsubscribe())
         assertArrayEquals(bytes('L'.code, 'S'.code, 'U'.code, 'R'.code, 0x01, 0x0C), Lsu.request(1, 0x0C))
+        // test_protocol: test_watch_round_trip
+        assertArrayEquals(
+            bytes('L'.code, 'S'.code, 'U'.code, 'W'.code, 3, 0x01, 0x0C, 0x01, 0x0D, 0x01, 0x42),
+            Lsu.watch(listOf(1 to 0x0C, 1 to 0x0D, 1 to 0x42)),
+        )
+        assertArrayEquals(bytes('L'.code, 'S'.code, 'U'.code, 'W'.code, 0), Lsu.watch(emptyList()))
     }
 
     // test_protocol: test_status_round_trip values.

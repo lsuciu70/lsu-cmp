@@ -14,6 +14,9 @@ object Lsu {
     private val MAGIC_STATUS = "LSUA".toByteArray()
     private val MAGIC_REQUEST = "LSUR".toByteArray()
     private val MAGIC_REQUEST_RESULT = "LSUK".toByteArray()
+    private val MAGIC_WATCH = "LSUW".toByteArray()
+    const val MAX_WATCH = 16
+    const val WATCH_RENEW_MS = 4000L  // the board drops a list after 10 s
     private const val STATUS_SIZE = 40
     private const val STATUS_VERSION = 1
     private const val REQUEST_RESULT_SIZE = 7
@@ -51,6 +54,13 @@ object Lsu {
 
     fun request(mode: Int, pid: Int): ByteArray =
         MAGIC_REQUEST + byteArrayOf(mode.toByte(), pid.toByte())
+
+    /** WATCH: the mode 01 PIDs the board should poll for this client. */
+    fun watch(entries: List<Pair<Int, Int>>): ByteArray {
+        val list = entries.take(MAX_WATCH)
+        return MAGIC_WATCH + byteArrayOf(list.size.toByte()) +
+            list.flatMap { (m, p) -> listOf(m.toByte(), p.toByte()) }.toByteArray()
+    }
 
     fun decodeStatus(p: ByteArray, n: Int): Status? {
         if (n != STATUS_SIZE || !startsWith(p, n, MAGIC_STATUS) || u8(p, 4) != STATUS_VERSION)

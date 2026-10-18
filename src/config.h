@@ -51,15 +51,20 @@ constexpr uint32_t kSubscriberTimeoutMs = 5000;
 constexpr int kMaxSubscribers = 4;
 
 // --- OBD2 requests (lsu_obd.h, SPEC.md §9) ---
-// Accepted REQUESTs wait in a queue and go on the bus at most one per
-// kMinRequestIntervalMs, for all subscribers together. A REQUEST already
-// in the queue is not queued twice; one arriving at a full queue is
-// refused (busy). The queue absorbs WiFi delivering several REQUESTs at
-// once: refusing those instead turned away about a third of the phone
-// app's requests. The Golf 7 engine ECU answers in 3-6 ms (ISO 15765-4
-// allows up to 50 ms).
+// One request goes on the bus at most every kMinRequestIntervalMs, for all
+// subscribers together: first the queued one-off REQUESTs, otherwise the
+// next PID of the watched list (union of the clients' WATCH lists, round
+// robin). The Golf 7 engine ECU answers in 3-6 ms (ISO 15765-4 allows up
+// to 50 ms).
 constexpr uint32_t kMinRequestIntervalMs = 20;
+// One-off REQUESTs wait here; a duplicate is not queued twice, a full
+// queue answers busy (WiFi delivers a client's REQUESTs in bunches).
 constexpr int kRequestQueueLen = 8;
+// No answer from any ECU for kEcuSilentMs (ignition off): poll the watched
+// list only one PID per kSlowPollMs, so the board does not fire 50
+// requests/s into a sleeping bus. Full rate again at the first answer.
+constexpr uint32_t kEcuSilentMs = 2000;
+constexpr uint32_t kSlowPollMs = 1000;
 // A first frame on 0x7E8..0x7EF gets a flow control only this long after
 // our last request, so we never answer for another tester on the bus.
 constexpr uint32_t kFlowControlWindowMs = 1000;

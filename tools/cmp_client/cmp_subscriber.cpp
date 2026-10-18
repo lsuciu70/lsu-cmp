@@ -97,6 +97,12 @@ bool CmpSubscriber::sendRequest(uint8_t mode, uint8_t pid) {
   return sendToEsp(msg, sizeof(msg));
 }
 
+bool CmpSubscriber::sendWatch(const lsu::WatchEntry* entries, int count) {
+  if (_sock < 0) return false;
+  uint8_t msg[lsu::kWatchMaxSize];
+  return sendToEsp(msg, lsu::encodeWatch(entries, count, msg));
+}
+
 bool CmpSubscriber::addresses(uint32_t& localIp, uint16_t& localPort, uint32_t& espIp) const {
   sockaddr_in local{};
   socklen_t len = sizeof(local);

@@ -44,7 +44,7 @@ import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import kotlinx.coroutines.delay
 
-/** The values shown, in this order, and requested in turn. */
+/** The values shown, in this order; the board polls them (WATCH). */
 val DASHBOARD = listOf(
     0x01 to 0x0C,  // engine speed
     0x01 to 0x0D,  // vehicle speed
@@ -56,14 +56,13 @@ val DASHBOARD = listOf(
     0x01 to 0x04,  // load
 )
 private val VIN = 0x09 to 0x02
-private const val REQUEST_INTERVAL_MS = 60L  // 9 requests: each value about every 0.5 s
 private const val STALE_MS = 3000L
 
 class MainViewModel : ViewModel() {
     val client = CmpClient(viewModelScope)
     var host by mutableStateOf("")
 
-    fun connect() = client.start(host, DASHBOARD + VIN, REQUEST_INTERVAL_MS)
+    fun connect() = client.start(host, DASHBOARD, listOf(VIN))
     fun disconnect() = client.stop()
 }
 

@@ -74,6 +74,27 @@ void test_request_result_round_trip() {
   TEST_ASSERT_FALSE(lsu::isStatus(buf, sizeof(buf)));
 }
 
+void test_watch_round_trip() {
+  const lsu::WatchEntry in[] = {{0x01, 0x0C}, {0x01, 0x0D}, {0x01, 0x42}};
+  uint8_t buf[lsu::kWatchMaxSize];
+  size_t n = lsu::encodeWatch(in, 3, buf);
+  const uint8_t expected[] = {'L', 'S', 'U', 'W', 3, 0x01, 0x0C, 0x01, 0x0D, 0x01, 0x42};
+  TEST_ASSERT_EQUAL(sizeof(expected), n);
+  TEST_ASSERT_EQUAL_HEX8_ARRAY(expected, buf, n);
+  lsu::WatchEntry out[lsu::kMaxWatch];
+  int count = 0;
+  TEST_ASSERT_TRUE(lsu::decodeWatch(buf, n, out, count));
+  TEST_ASSERT_EQUAL(3, count);
+  TEST_ASSERT_EQUAL_HEX8(0x0D, out[1].pid);
+  TEST_ASSERT_FALSE(lsu::decodeWatch(buf, n - 1, out, count));  // length mismatch
+  buf[4] = lsu::kMaxWatch + 1;
+  TEST_ASSERT_FALSE(lsu::decodeWatch(buf, n, out, count));      // too many
+  uint8_t empty[5];
+  TEST_ASSERT_EQUAL(5, lsu::encodeWatch(in, 0, empty));         // stop watching
+  TEST_ASSERT_TRUE(lsu::decodeWatch(empty, 5, out, count));
+  TEST_ASSERT_EQUAL(0, count);
+}
+
 }  // namespace
 
 int main() {
@@ -84,5 +105,6 @@ int main() {
   RUN_TEST(test_status_not_confused_with_cmp);
   RUN_TEST(test_request_round_trip);
   RUN_TEST(test_request_result_round_trip);
+  RUN_TEST(test_watch_round_trip);
   return UNITY_END();
 }
