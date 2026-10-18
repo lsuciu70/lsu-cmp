@@ -41,11 +41,18 @@ class CmpClient(private val scope: CoroutineScope) {
         val refused: Long = 0,
         val lastRefusal: String? = null,
         val error: String? = null,
+        /** Connection events, oldest first, "HH:mm:ss  text". */
+        val log: List<String> = emptyList(),
     )
 
     private val _state = MutableStateFlow(State())
     val state: StateFlow<State> = _state
     private var job: Job? = null
+    private val clock = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.ROOT)
+
+    private fun log(text: String) = _state.update {
+        it.copy(log = (it.log + "${clock.format(java.util.Date())}  $text").takeLast(LOG_LINES))
+    }
 
     /**
      * Starts talking to [host] (an IP or name), or searches the local
@@ -55,20 +62,24 @@ class CmpClient(private val scope: CoroutineScope) {
      */
     fun start(host: String, watch: List<Pair<Int, Int>>, oneOff: List<Pair<Int, Int>>) {
         stop()
-        _state.value = State(phase = Phase.SEARCHING)
+        _state.update { State(phase = Phase.SEARCHING, log = it.log) }
+        log(if (host.isBlank()) "searching for the board" else "connecting to ${host.trim()}")
         job = scope.launch(Dispatchers.IO) {
             try {
                 run(host.trim(), watch, oneOff)
             } catch (e: Exception) {
                 _state.update { it.copy(phase = Phase.IDLE, error = e.message ?: e.toString()) }
+                log("error: ${e.message ?: e}")
             }
         }
     }
 
     fun stop() {
+        if (job == null) return
         job?.cancel()
         job = null
         _state.update { it.copy(phase = Phase.IDLE) }
+        log("disconnected")
     }
 
     private suspend fun run(host: String, watch: List<Pair<Int, Int>>, oneOff: List<Pair<Int, Int>>) {
@@ -114,9 +125,10 @@ class CmpClient(private val scope: CoroutineScope) {
                 if (esp != null && now - lastStatus >= 3000) {
                     // Searching again lets a board that got a new IP be found.
                     if (fixed == null && now - lastStatus >= 6000) esp = null
-                    _state.update {
-                        it.copy(phase = if (esp == null) Phase.SEARCHING else Phase.UNREACHABLE)
-                    }
+                    val phase = if (esp == null) Phase.SEARCHING else Phase.UNREACHABLE
+                    if (phase != _state.value.phase)
+                        log(if (esp == null) "searching for the board again" else "no answer from the board")
+                    _state.update { it.copy(phase = phase) }
                 }
 
                 try {
@@ -130,6 +142,7 @@ class CmpClient(private val scope: CoroutineScope) {
                     // Only a STATUS identifies the board.
                     if (packet.port != Lsu.CONTROL_PORT || Lsu.decodeStatus(buf, n) == null) continue
                     esp = from
+                    log("board found at ${from.hostAddress}")
                 } else if (from != esp) {
                     continue
                 }
@@ -138,11 +151,19 @@ class CmpClient(private val scope: CoroutineScope) {
                     lastStatus = System.currentTimeMillis()
                     // Uptime going back: the board restarted. Start the
                     // counters over, so its restart does not show as losses.
-                    val restarted = _state.value.status?.let { st.uptimeS < it.uptimeS } == true
+                    val old = _state.value
+                    val restarted = old.status?.let { st.uptimeS < it.uptimeS } == true
                     if (restarted) {
                         expectedSeq = -1
                         nextWatch = 0  // the restarted board knows nothing of our list
+                        log("board restarted")
                     }
+                    if (old.phase != Phase.CONNECTED)
+                        log("connected: CAN ${st.canStateName}, ${st.bitrateKbps} kbit/s")
+                    else if (old.status != null && st.canState != old.status.canState)
+                        log("CAN ${old.status.canStateName} -> ${st.canStateName}")
+                    if (old.status != null && !restarted && st.busErrors > old.status.busErrors)
+                        log("CAN bus errors: ${st.busErrors}")
                     _state.update {
                         val base = if (restarted) it.copy(frames = 0, lost = 0, refused = 0, lastRefusal = null) else it
                         base.copy(phase = Phase.CONNECTED, esp = from.hostAddress, status = st, error = null)
@@ -155,11 +176,10 @@ class CmpClient(private val scope: CoroutineScope) {
                         nextSubscribe = 0
                         nextWatch = 0
                     }
-                    if (r.result != Lsu.REQUEST_SENT) _state.update {
-                        it.copy(
-                            refused = it.refused + 1,
-                            lastRefusal = "%02X %02X: %s".format(r.mode, r.pid, r.resultName),
-                        )
+                    if (r.result != Lsu.REQUEST_SENT) {
+                        val text = "%02X %02X: %s".format(r.mode, r.pid, r.resultName)
+                        if (text != _state.value.lastRefusal) log("request refused, $text")
+                        _state.update { it.copy(refused = it.refused + 1, lastRefusal = text) }
                     }
                 }
                 Cmp.decode(buf, n)?.let { pkt ->
@@ -169,8 +189,10 @@ class CmpClient(private val scope: CoroutineScope) {
                     if (lost >= 0x8000) lost = 0
                     expectedSeq = (pkt.sequenceCounter + 1) and 0xFFFF
                     val answer = decoder.feed(pkt.frame)
-                    if (answer != null && answer.mode == Obd.MODE_VEHICLE_INFO)
+                    if (lost > 0) log("$lost packet(s) lost")
+                    if (answer != null && answer.mode == Obd.MODE_VEHICLE_INFO &&
                         pending.remove(answer.mode to answer.pid)
+                    ) log("${answer.name}: ${answer.text}")
                     _state.update {
                         it.copy(
                             frames = it.frames + 1,
@@ -187,6 +209,10 @@ class CmpClient(private val scope: CoroutineScope) {
             socket.close()
             _state.update { it.copy(phase = Phase.IDLE) }
         }
+    }
+
+    private companion object {
+        const val LOG_LINES = 200
     }
 
     /** Broadcast address of every IPv4 network the phone is on. */

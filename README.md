@@ -271,9 +271,13 @@ pcap reader and writer: `ctest --test-dir tools/cmp_client/build`.
 ## Android app
 
 [android/](android/) (Kotlin, Jetpack Compose, Android 10+; tested on a
-Galaxy S23 Ultra with Android 16): a dashboard on the phone with large
-tiles for engine speed, vehicle speed, intake manifold pressure, coolant,
-voltage, throttle, MAF and load, plus the VIN. It speaks the same protocol
+Galaxy S23 Ultra with Android 16). Two screens: a connect screen (board IP,
+Connect, status and event log), and from the board's first answer a
+dashboard that fits on one screen: engine speed on an arc gauge (red zone
+from 4500 rpm) with the vehicle speed and VIN beside it, six tiles with a
+meter bar (manifold pressure, coolant, voltage, throttle, MAF, load), and
+at the bottom Disconnect, a status line and the event log. Warning colors
+appear only out of range and always with a word (HIGH, HOT, LOW). It speaks the same protocol
 as `cmp_client` ([Protocol.kt](android/app/src/main/java/io/github/lsuciu70/lsucmp/Protocol.kt),
 [ObdDecoder.kt](android/app/src/main/java/io/github/lsuciu70/lsucmp/ObdDecoder.kt),
 ports of the C++ sources, with the same golden-byte tests). It asks the
@@ -287,6 +291,8 @@ board to poll those PIDs (WATCH) and requests the VIN until it arrives.
 - **At home without the car:** `cmp_replay drive.pcap --bind 0.0.0.0
   --loop` on the laptop; the app finds it the same way.
 - Values older than 3 s are dimmed; the screen stays on while connected.
+- The event log records searching, the board found, connected, board
+  restarted, no answer, CAN bus errors, refused requests and the VIN.
 
 Build and install (Android SDK in `~/Android/Sdk`, USB debugging on):
 
