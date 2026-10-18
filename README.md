@@ -292,6 +292,12 @@ board to poll those PIDs (WATCH) and requests the VIN until it arrives.
   whatever IP the phone hands out. A fixed IP can be typed in instead.
 - **At home without the car:** `cmp_replay drive.pcap --bind 0.0.0.0
   --loop` on the laptop; the app finds it the same way.
+- An info icon next to the VIN (only when there is something to show)
+  opens what the phone can decode from it, offline
+  ([VinDecoder.kt](android/app/src/main/java/io/github/lsuciu70/lsucmp/VinDecoder.kt)):
+  manufacturer, country, model year, and for VW the model and plant.
+  Only codes known with confidence; color, trim and options are not in a
+  VIN.
 - Values older than 3 s are dimmed; the screen stays on while connected.
 - The event log records searching, the board found, connected, board
   restarted, no answer, car answering (ignition on) / car silent for 3 s

@@ -18,6 +18,7 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -29,11 +30,17 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawingPadding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.Info
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.Icon
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
@@ -300,12 +307,43 @@ private fun SpeedPanel(state: CmpClient.State, now: Long, modifier: Modifier) {
         }
         state.values[VIN.first shl 8 or VIN.second]?.let { (v, _) ->
             Column {
-                Text("VIN", color = Ink.muted, fontSize = 11.sp)
+                val decoded = remember(v.text) { VinDecoder.decode(v.text) }
+                var showInfo by remember { mutableStateOf(false) }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("VIN", color = Ink.muted, fontSize = 11.sp)
+                    // Only when the VIN tells something beyond itself.
+                    if (decoded.isNotEmpty()) {
+                        Icon(Icons.Outlined.Info, contentDescription = "What the VIN says", tint = Ink.secondary,
+                            modifier = Modifier.padding(start = 6.dp).size(18.dp).clickable { showInfo = true })
+                    }
+                }
+                if (showInfo) VinInfoDialog(v.text, decoded) { showInfo = false }
                 Text(v.text, color = Ink.secondary, fontSize = 9.sp, fontFamily = FontFamily.Monospace,
                     maxLines = 1, softWrap = false)
             }
         }
     }
+}
+
+/** What could be read from the VIN on the phone (VinDecoder). */
+@Composable
+private fun VinInfoDialog(vin: String, decoded: List<Pair<String, String>>, onClose: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onClose,
+        confirmButton = { TextButton(onClick = onClose) { Text("Close") } },
+        title = { Text(vin, fontFamily = FontFamily.Monospace, fontSize = 18.sp) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                for ((label, value) in decoded) {
+                    Row {
+                        Text(label, color = Ink.muted, fontSize = 13.sp, modifier = Modifier.weight(0.42f))
+                        Text(value, color = Ink.primary, fontSize = 13.sp, modifier = Modifier.weight(0.58f))
+                    }
+                }
+            }
+        },
+        containerColor = Ink.surface,
+    )
 }
 
 /** One value: label, figure, and a meter bar under it. */
