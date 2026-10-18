@@ -56,7 +56,7 @@ val DASHBOARD = listOf(
     0x01 to 0x04,  // load
 )
 private val VIN = 0x09 to 0x02
-private const val REQUEST_INTERVAL_MS = 150L
+private const val REQUEST_INTERVAL_MS = 60L  // 9 requests: each value about every 0.5 s
 private const val STALE_MS = 3000L
 
 class MainViewModel : ViewModel() {

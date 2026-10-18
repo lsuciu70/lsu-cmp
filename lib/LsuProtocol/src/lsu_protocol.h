@@ -44,12 +44,12 @@ constexpr size_t kRequestSize = 6;
 constexpr size_t kRequestResultSize = 7;
 
 enum RequestResult : uint8_t {
-  kRequestSent = 0,           // queued for transmission on the bus
+  kRequestSent = 0,           // accepted: queued for the bus (or already queued)
   kRequestNotAllowed = 1,     // not in the whitelist (lsu_obd.h)
   kRequestNotSubscribed = 2,  // only the current subscriber may request
-  kRequestBusy = 3,           // too soon after the previous request
+  kRequestBusy = 3,           // request queue full
   kRequestTxDisabled = 4,     // firmware built listen-only (CAN_ACK=0)
-  kRequestTxFailed = 5,       // TWAI refused it (bus-off, TX queue full)
+  kRequestTxFailed = 5,       // TWAI refused it (not returned since requests are queued)
 };
 
 inline const char* requestResultName(uint8_t r) {

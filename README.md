@@ -97,10 +97,17 @@ as malformed CMP packets.
 
 ## OBD2 requests (SPEC.md §9)
 
-- The ESP32 accepts a REQUEST only from the current subscriber, only for
-  mode 01 (current data) or 09 (vehicle information), at most one every
-  50 ms, and only when built with `CAN_ACK=1`. Anything else is refused
-  with a REQUEST_RESULT saying why; nothing goes on the bus.
+- The ESP32 accepts a REQUEST from any current subscriber, only for
+  mode 01 (current data) or 09 (vehicle information), and only when built
+  with `CAN_ACK=1`. Anything else is refused with a REQUEST_RESULT saying
+  why; nothing goes on the bus.
+- Accepted requests wait in a queue of 8 and go on the bus one every
+  20 ms, for all subscribers together. A request already waiting is not
+  queued twice (its answer reaches every subscriber). Only a full queue
+  refuses a request as busy. REQUEST_RESULT "sent" means accepted; a
+  transmit error later only shows in the board's stats (`tx_err`).
+  Without the queue, WiFi delivering several REQUESTs at once got about a
+  third of the phone app's requests refused.
 - It sends the request as a single frame on `0x7DF` (functional, all
   emission ECUs): `02 <mode> <PID>`, padded to 8 bytes with `0xAA`, as the
   engine ECU pads its answers.
@@ -258,7 +265,7 @@ voltage, throttle, MAF and load, plus the VIN. It speaks the same protocol
 as `cmp_client` ([Protocol.kt](android/app/src/main/java/io/github/lsuciu70/lsucmp/Protocol.kt),
 [ObdDecoder.kt](android/app/src/main/java/io/github/lsuciu70/lsucmp/ObdDecoder.kt),
 ports of the C++ sources, with the same golden-byte tests) and requests
-those PIDs in turn every 150 ms.
+those PIDs in turn every 60 ms (each value about every 0.5 s).
 
 - **Finding the board:** with the IP field blank, SUBSCRIBE goes out as a
   broadcast on every network the phone is on; the board's STATUS reply

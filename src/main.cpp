@@ -8,8 +8,9 @@
 //   sender   - one CMP packet per CAN frame, UDP from the data port to the
 //              subscriber (§5.2)
 //   control  - receives SUBSCRIBE / UNSUBSCRIBE / REQUEST on the control
-//              port, replies STATUS / REQUEST_RESULT; puts whitelisted OBD2
-//              requests on the bus (SPEC.md §9)
+//              port, replies STATUS / REQUEST_RESULT; queues whitelisted
+//              OBD2 requests (SPEC.md §9)
+//   requests - puts the queued OBD2 requests on the bus, spaced out
 //   loop()   - LsuWifi web UI, ArduinoOTA, TCP log client and a periodic
 //              stats log (net_log.h: USB serial + TCP port kLogTcpPort)
 //
@@ -75,6 +76,17 @@ volatile uint32_t statSendErr = 0;
 volatile uint32_t statObdRequests = 0;
 volatile uint32_t statFlowControls = 0;
 volatile uint32_t statTxErr = 0;
+volatile uint32_t statObdBusy = 0;
+
+// Accepted OBD2 requests waiting for the bus (ring buffer, guarded by
+// requestMux); requestTask sends them.
+struct ObdRequest {
+  uint8_t mode, pid;
+};
+portMUX_TYPE requestMux = portMUX_INITIALIZER_UNLOCKED;
+ObdRequest requestQueue[kRequestQueueLen];
+int requestHead = 0, requestCount = 0;
+TaskHandle_t requestTaskHandle = nullptr;
 
 // esp_timer ms of the last OBD2 request put on the bus, 0 = none yet.
 std::atomic<uint32_t> lastRequestMs{0};
@@ -194,20 +206,64 @@ void maybeSendFlowControl(const twai_message_t& msg) {
   if (transmit(obd::flowControlId(msg.identifier), fc)) statFlowControls++;
 }
 
+// Queues an accepted request, unless the same one is already waiting (its
+// answer reaches every subscriber anyway). False if the queue is full.
+bool queueRequest(uint8_t mode, uint8_t pid) {
+  portENTER_CRITICAL(&requestMux);
+  bool queued = false;
+  for (int i = 0; i < requestCount && !queued; i++) {
+    const ObdRequest& r = requestQueue[(requestHead + i) % kRequestQueueLen];
+    queued = r.mode == mode && r.pid == pid;
+  }
+  bool ok = queued || requestCount < kRequestQueueLen;
+  if (!queued && ok) {
+    requestQueue[(requestHead + requestCount) % kRequestQueueLen] = {mode, pid};
+    requestCount++;
+  }
+  portEXIT_CRITICAL(&requestMux);
+  if (ok) xTaskNotifyGive(requestTaskHandle);
+  return ok;
+}
+
+bool popRequest(ObdRequest& out) {
+  portENTER_CRITICAL(&requestMux);
+  bool any = requestCount > 0;
+  if (any) {
+    out = requestQueue[requestHead];
+    requestHead = (requestHead + 1) % kRequestQueueLen;
+    requestCount--;
+  }
+  portEXIT_CRITICAL(&requestMux);
+  return any;
+}
+
 uint8_t handleRequest(const sockaddr_in& from, uint8_t mode, uint8_t pid) {
   if (!isSubscriber(from)) return lsu::kRequestNotSubscribed;
   if (!obd::isAllowedRequest(mode, pid)) return lsu::kRequestNotAllowed;
   if (!CAN_ACK) return lsu::kRequestTxDisabled;
-  uint32_t now = nowMs();
-  uint32_t last = lastRequestMs;
-  if (last != 0 && now - last < kMinRequestIntervalMs) return lsu::kRequestBusy;
-  uint8_t data[8];
-  obd::buildRequest(mode, pid, data);
-  // Before transmit: the first frame of the answer may come back quickly.
-  lastRequestMs = now ? now : 1;
-  if (!transmit(obd::kFunctionalRequestId, data)) return lsu::kRequestTxFailed;
-  statObdRequests++;
+  if (!queueRequest(mode, pid)) {
+    statObdBusy++;
+    return lsu::kRequestBusy;
+  }
   return lsu::kRequestSent;
+}
+
+// Puts the queued requests on the bus, kMinRequestIntervalMs apart.
+void requestTask(void*) {
+  ObdRequest r;
+  for (;;) {
+    if (!popRequest(r)) {
+      ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+      continue;
+    }
+    uint8_t data[8];
+    obd::buildRequest(r.mode, r.pid, data);
+    // Before transmit: the first frame of the answer may come back quickly.
+    uint32_t now = nowMs();
+    lastRequestMs = now ? now : 1;
+    if (transmit(obd::kFunctionalRequestId, data)) statObdRequests++;
+    vTaskDelay(pdMS_TO_TICKS(kMinRequestIntervalMs));
+  }
 }
 
 void captureTask(void*) {
@@ -378,13 +434,13 @@ void logStats() {
   const char* ip = list[0] ? list : "-";
   netLog.printf(
       "[stats] can=%s rx=%lu no_sub=%lu q_full=%lu sent=%lu send_err=%lu | "
-      "twai missed=%lu overrun=%lu bus_err=%lu | obd req=%lu fc=%lu tx_err=%lu | "
+      "twai missed=%lu overrun=%lu bus_err=%lu | obd req=%lu busy=%lu fc=%lu tx_err=%lu | "
       "sub=%s\n",
       lsu::canStateName(st.canState), (unsigned long)st.canRx,
       (unsigned long)statNoSubscriber, (unsigned long)st.queueFull,
       (unsigned long)st.sent, (unsigned long)st.sendErrors,
       (unsigned long)st.rxMissed, (unsigned long)st.rxOverrun,
-      (unsigned long)st.busErrors, (unsigned long)statObdRequests,
+      (unsigned long)st.busErrors, (unsigned long)statObdRequests, (unsigned long)statObdBusy,
       (unsigned long)statFlowControls, (unsigned long)statTxErr, ip);
 }
 
@@ -459,6 +515,7 @@ void setup() {
   if (!openSockets()) return;
   xTaskCreate(captureTask, "capture", 3072, nullptr, 5, nullptr);
   xTaskCreate(senderTask, "sender", 4096, nullptr, 4, nullptr);
+  xTaskCreate(requestTask, "requests", 3072, nullptr, 4, &requestTaskHandle);
   xTaskCreate(controlTask, "control", 4096, nullptr, 3, nullptr);
 }
 

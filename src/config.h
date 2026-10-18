@@ -51,9 +51,15 @@ constexpr uint32_t kSubscriberTimeoutMs = 5000;
 constexpr int kMaxSubscribers = 4;
 
 // --- OBD2 requests (lsu_obd.h, SPEC.md §9) ---
-// A REQUEST arriving sooner than this after the previous one is refused
-// (busy). ECUs answer within 50 ms (ISO 15765-4 P2).
-constexpr uint32_t kMinRequestIntervalMs = 50;
+// Accepted REQUESTs wait in a queue and go on the bus at most one per
+// kMinRequestIntervalMs, for all subscribers together. A REQUEST already
+// in the queue is not queued twice; one arriving at a full queue is
+// refused (busy). The queue absorbs WiFi delivering several REQUESTs at
+// once: refusing those instead turned away about a third of the phone
+// app's requests. The Golf 7 engine ECU answers in 3-6 ms (ISO 15765-4
+// allows up to 50 ms).
+constexpr uint32_t kMinRequestIntervalMs = 20;
+constexpr int kRequestQueueLen = 8;
 // A first frame on 0x7E8..0x7EF gets a flow control only this long after
 // our last request, so we never answer for another tester on the bus.
 constexpr uint32_t kFlowControlWindowMs = 1000;
