@@ -132,11 +132,19 @@ class CmpClient(private val scope: CoroutineScope) {
 
                 Lsu.decodeStatus(buf, n)?.let { st ->
                     lastStatus = System.currentTimeMillis()
+                    // Uptime going back: the board restarted. Start the
+                    // counters over, so its restart does not show as losses.
+                    val restarted = _state.value.status?.let { st.uptimeS < it.uptimeS } == true
+                    if (restarted) expectedSeq = -1
                     _state.update {
-                        it.copy(phase = Phase.CONNECTED, esp = from.hostAddress, status = st, error = null)
+                        val base = if (restarted) it.copy(frames = 0, lost = 0, refused = 0, lastRefusal = null) else it
+                        base.copy(phase = Phase.CONNECTED, esp = from.hostAddress, status = st, error = null)
                     }
                 }
                 Lsu.decodeRequestResult(buf, n)?.let { r ->
+                    // The board forgot us (restart, or no SUBSCRIBE for 5 s):
+                    // subscribe again now instead of at the next second.
+                    if (r.result == Lsu.REQUEST_NOT_SUBSCRIBED) nextSubscribe = 0
                     if (r.result != Lsu.REQUEST_SENT) _state.update {
                         it.copy(
                             refused = it.refused + 1,
@@ -145,7 +153,10 @@ class CmpClient(private val scope: CoroutineScope) {
                     }
                 }
                 Cmp.decode(buf, n)?.let { pkt ->
-                    val lost = if (expectedSeq >= 0) (pkt.sequenceCounter - expectedSeq) and 0xFFFF else 0
+                    var lost = if (expectedSeq >= 0) (pkt.sequenceCounter - expectedSeq) and 0xFFFF else 0
+                    // A jump of more than half the counter is the sequence
+                    // starting over (new subscription), not 30000+ losses.
+                    if (lost >= 0x8000) lost = 0
                     expectedSeq = (pkt.sequenceCounter + 1) and 0xFFFF
                     val answer = decoder.feed(pkt.frame)
                     if (answer != null && answer.mode == Obd.MODE_VEHICLE_INFO)

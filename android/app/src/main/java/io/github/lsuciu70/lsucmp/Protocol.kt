@@ -23,6 +23,7 @@ object Lsu {
         "sent", "not allowed", "not subscribed", "busy", "transmit disabled", "transmit failed",
     )
     const val REQUEST_SENT = 0
+    const val REQUEST_NOT_SUBSCRIBED = 2
 
     data class Status(
         val canState: Int,
