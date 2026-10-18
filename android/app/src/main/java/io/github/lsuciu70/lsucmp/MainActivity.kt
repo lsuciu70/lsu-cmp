@@ -11,6 +11,7 @@
 // alone.
 package io.github.lsuciu70.lsucmp
 
+import android.app.Application
 import android.os.Bundle
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
@@ -39,6 +40,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.Icon
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.MaterialTheme
@@ -65,11 +67,14 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.lifecycle.ViewModel
+import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import kotlinx.coroutines.delay
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import kotlin.math.cos
 import kotlin.math.sin
 
@@ -131,12 +136,39 @@ private val TILES = listOf(
     Gauge(0x04, "engine load", "%", 0.0, 100.0, 0),
 )
 
-class MainViewModel : ViewModel() {
+class MainViewModel(app: Application) : AndroidViewModel(app) {
     val client = CmpClient(viewModelScope)
     var host by mutableStateOf("")
+    private val recorder = PcapRecorder(app.contentResolver).also { client.recorder = it }
+    var recording by mutableStateOf(false)
+        private set
 
     fun connect() = client.start(host, DASHBOARD, listOf(VIN))
-    fun disconnect() = client.stop()
+    fun disconnect() {
+        record(false)
+        client.stop()
+    }
+
+    /** Starts or stops recording to Download/lsu-cmp/. */
+    fun record(on: Boolean) {
+        if (on == recording) return
+        if (on) {
+            val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.ROOT).format(Date())
+            val vin = client.state.value.values[VIN.first shl 8 or VIN.second]?.first?.text
+            val name = "lsu-cmp_$stamp${vin?.let { "_$it" } ?: ""}.pcap"
+            runCatching { recorder.start(name) }
+                .onSuccess { recording = true; client.log("recording to Download/lsu-cmp/$name") }
+                .onFailure { client.log("cannot record: ${it.message}") }
+        } else {
+            val name = recorder.stop()
+            recording = false
+            client.log("recording saved: $name (${recorder.packets} packets)")
+        }
+    }
+
+    override fun onCleared() {
+        recorder.stop()
+    }
 }
 
 class MainActivity : ComponentActivity() {
@@ -387,7 +419,11 @@ private fun ConnectionPanel(vm: MainViewModel, state: CmpClient.State, modifier:
         modifier.fillMaxWidth().background(Ink.surface, RoundedCornerShape(12.dp)).padding(10.dp),
         verticalArrangement = Arrangement.spacedBy(6.dp),
     ) {
-        Button(onClick = { vm.disconnect() }, modifier = Modifier.fillMaxWidth()) { Text("Disconnect") }
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Button(onClick = { vm.disconnect() }, modifier = Modifier.weight(1f)) { Text("Disconnect") }
+            Checkbox(checked = vm.recording, onCheckedChange = { vm.record(it) })
+            Text("Record", color = Ink.secondary, fontSize = 13.sp)
+        }
         StatusAndLog(state, Modifier.weight(1f))
     }
 }

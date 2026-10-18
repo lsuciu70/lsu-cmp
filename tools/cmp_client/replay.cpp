@@ -105,9 +105,11 @@ int openSocket(in_addr ip, uint16_t port) {
 }
 
 // The CMP packets and STATUS messages the ESP32 sent in the recording,
-// from either of its ports (before 2026-10-17 both came from the data port).
-bool loadRecording(const std::string& path, uint16_t dataPort, uint16_t controlPort,
-                   std::vector<Event>& events) {
+// recognized by their content, whatever port they came from (the board's
+// ports changed over time, and --data-port / --control-port only choose
+// where this player listens). The client's own messages (SUBSCRIBE,
+// WATCH, REQUEST) are neither, so they are skipped.
+bool loadRecording(const std::string& path, std::vector<Event>& events) {
   PcapReader reader;
   std::string error;
   if (!reader.open(path, &error)) {
@@ -117,7 +119,6 @@ bool loadRecording(const std::string& path, uint16_t dataPort, uint16_t controlP
   UdpRecord r;
   uint64_t first = 0;
   while (reader.next(r)) {
-    if (r.srcPort != dataPort && r.srcPort != controlPort) continue;  // laptop -> ESP32
     bool isStatus = lsu::isStatus(r.payload.data(), r.payload.size());
     cmp::DecodedCanPacket pkt;
     if (!isStatus && !cmp::decodeCanPacket(r.payload.data(), r.payload.size(), pkt))
@@ -167,12 +168,11 @@ int main(int argc, char** argv) {
   }
 
   std::vector<Event> events;
-  if (!loadRecording(path, dataPort, controlPort, events)) return 1;
+  if (!loadRecording(path, events)) return 1;
   size_t frames = 0, statuses = 0;
   for (const Event& e : events) (e.isStatus ? statuses : frames)++;
   if (frames == 0) {
-    fprintf(stderr, "%s: no CMP packets from port %u or %u\n", path.c_str(), dataPort,
-            controlPort);
+    fprintf(stderr, "%s: no CMP packets\n", path.c_str());
     return 1;
   }
   double durationS = events.back().atNs / 1e9;

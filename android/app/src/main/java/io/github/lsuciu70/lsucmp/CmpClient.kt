@@ -50,9 +50,12 @@ class CmpClient(private val scope: CoroutineScope) {
     private val _state = MutableStateFlow(State())
     val state: StateFlow<State> = _state
     private var job: Job? = null
+
+    /** Gets every datagram from the board while recording (see PcapRecorder). */
+    var recorder: PcapRecorder? = null
     private val clock = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.ROOT)
 
-    private fun log(text: String) = _state.update {
+    fun log(text: String) = _state.update {
         it.copy(log = (it.log + "${clock.format(java.util.Date())}  $text").takeLast(LOG_LINES))
     }
 
@@ -102,6 +105,8 @@ class CmpClient(private val scope: CoroutineScope) {
         var nextRequest = 0L
         var lastStatus = System.currentTimeMillis()
         var lastAnswer = 0L
+        var lastFlush = 0L
+        var localIp = ByteArray(4)  // this phone's address toward the board, for the pcap
         var expectedSeq = -1
 
         fun send(data: ByteArray, to: InetAddress) =
@@ -150,8 +155,16 @@ class CmpClient(private val scope: CoroutineScope) {
                     if (packet.port != Lsu.CONTROL_PORT || Lsu.decodeStatus(buf, n) == null) continue
                     esp = from
                     log("board found at ${from.hostAddress}")
-                } else if (from != esp) {
-                    continue
+                }
+                if (from != esp) continue
+                if (localIp.all { it == 0.toByte() }) localIp = localAddressToward(from)
+                recorder?.takeIf { it.isRecording }?.let {
+                    it.write(System.currentTimeMillis() * 1_000_000, from.address, packet.port,
+                        localIp, socket.localPort, buf, n)
+                    if (now - lastFlush >= 1000) {  // lose at most a second on a crash
+                        it.flush()
+                        lastFlush = now
+                    }
                 }
 
                 Lsu.decodeStatus(buf, n)?.let { st ->
@@ -229,6 +242,14 @@ class CmpClient(private val scope: CoroutineScope) {
         const val LOG_LINES = 200
         const val CAR_SILENT_MS = 3000L
     }
+
+    /** The phone's IPv4 address on the route to [to] (connect() sends nothing). */
+    private fun localAddressToward(to: InetAddress): ByteArray = runCatching {
+        DatagramSocket().use { s ->
+            s.connect(to, Lsu.CONTROL_PORT)
+            s.localAddress.address
+        }
+    }.getOrDefault(ByteArray(4))
 
     /** Broadcast address of every IPv4 network the phone is on. */
     private fun broadcastAddresses(): List<InetAddress> =

@@ -231,8 +231,10 @@ unchanged, at home, without the car:
 
 Recordings are classic pcap with nanosecond timestamps and bare IPv4/UDP
 headers (LINKTYPE_RAW). The player also reads Wireshark/tcpdump captures
-in classic pcap (Ethernet or Linux cooked), not pcapng; it plays only the
-datagrams sent from port 12670 or 12671.
+in classic pcap (Ethernet or Linux cooked), not pcapng. It plays the CMP
+and STATUS datagrams it finds, recognized by content and not by port;
+`--data-port` / `--control-port` only choose where it listens, so two
+players can run side by side.
 
 Log: `pio device monitor` over WiFi (TCP port 23, 192.168.100.240 by
 default; in AP mode `--port socket://10.10.10.10:23`), or
@@ -298,6 +300,11 @@ board to poll those PIDs (WATCH) and requests the VIN until it arrives.
   manufacturer, country, model year, and for VW the model and plant.
   Only codes known with confidence; color, trim and options are not in a
   VIN.
+- **Record** (checkbox next to Disconnect) writes everything the board
+  sends to `Download/lsu-cmp/lsu-cmp_<date>_<time>_<VIN>.pcap`, in the
+  same format as `cmp_client --record` (Wireshark, `cmp_replay`). To the
+  laptop: `adb pull /sdcard/Download/lsu-cmp/ .`, the USB cable (MTP), or
+  Share from the phone's file manager.
 - Values older than 3 s are dimmed; the screen stays on while connected.
 - The event log records searching, the board found, connected, board
   restarted, no answer, car answering (ignition on) / car silent for 3 s
