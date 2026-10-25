@@ -21,8 +21,12 @@ without reflashing.
 - If none connects (or none is saved) it starts its own access point:
   - IP `10.10.10.10`
   - SSID `lsu-esp32`, password `12345678`
+- Each external network uses DHCP, or an optional **static IP** set for it
+  (IP, gateway, mask, DNS). A static IP wins over DHCP, and is set per
+  network because it only makes sense in that network's subnet: a board
+  that moves to a phone hotspot still gets a DHCP address there.
 - Web UI at `http://<ip>/wifi` (`/` redirects there), in both modes:
-  - add / edit / delete external networks (up to 10)
+  - add / edit / delete external networks (up to 10), with optional static IP
   - change the AP SSID and password
   - Restart button (changes apply after restart)
 - Settings are stored in NVS (namespace `lsuwifi`) and survive reflashing
@@ -39,6 +43,13 @@ without reflashing.
    on the serial log (`[LsuWifi] connected to '...', IP ...`). A DHCP
    reservation in the router keeps the IP fixed. The MAC to reserve for is
    shown on the `/wifi` page (and in the serial log at boot).
+5. Or, without access to the router: open **Static IP** under the network
+   on the `/wifi` page, set IP and gateway, Save, Restart. Pick an IP outside
+   the router's DHCP range, or another device may get the same address.
+   The page rejects an IP that is not in the gateway's subnet. If the board
+   still becomes unreachable (e.g. a wrong gateway), turn the network off
+   for 20 s or move out of range: the board then starts its AP, and the
+   setting can be fixed at `http://10.10.10.10/wifi`.
 
 ## Adding it to a project
 
@@ -46,12 +57,12 @@ without reflashing.
 
 ```ini
 lib_deps =
-    git+ssh://git@github.com/lsuciu70/lsu-esp32-wifi.git#v0.2.0
+    git+ssh://git@github.com/lsuciu70/lsu-esp32-wifi.git#v0.3.0
 ```
 
 The repo is private, so the SSH URL is used (it relies on the machine's
 GitHub SSH key). The plain `https://` URL only works if the repo is made
-public. `#v0.2.0` pins a release tag; drop it to follow `main`. While
+public. `#v0.3.0` pins a release tag; drop it to follow `main`. While
 changing the library and a project together, use the local checkout instead:
 edits are picked up on the next build, with no push needed.
 
@@ -104,10 +115,11 @@ In the app's menu: `<a href="/wifi">WiFi setup</a>`. To show the WiFi state
 in the app's own page, read `GET /wifi/status`:
 
 ```json
-{"mode":"sta","connected":true,"ssid":"cls-router","ip":"192.168.100.240","mac":"AC:27:6E:5E:8E:E8","rssi":-48}
+{"mode":"sta","connected":true,"ssid":"cls-router","ip":"192.168.100.240","mac":"AC:27:6E:5E:8E:E8","rssi":-48,"static":false}
 ```
 
-(`mode` is `"ap"` or `"sta"`; `rssi` is present only in `sta` mode.)
+(`mode` is `"ap"` or `"sta"`; `rssi` and `static` are present only in `sta`
+mode.)
 
 **C. The app has its own web UI on another server that needs port 80**
 (`AsyncWebServer`, an HTTPS library's HTTP server, ...). Move LsuWifi to

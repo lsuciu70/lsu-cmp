@@ -53,7 +53,7 @@ Things to keep in mind (not yet measured or verified):
 | deviceId / streamId | 1 / 1, chosen locally, **not** from an official ASAM registry |
 | UDP ports | 12670 (data: CMP only) and 12671 (control: own protocol), arbitrary, **not** IANA-registered |
 | Destination | subscription model: clients subscribe to the ESP32, which sends unicast to each subscriber (up to 4 at once) |
-| WiFi | [LsuWifi](README-WIFI.md) library v0.2.0: saved networks in priority order, follows network changes; default AP `lsu-cmp` / `12345678` at `10.10.10.10` |
+| WiFi | [LsuWifi](README-WIFI.md) library v0.3.0: saved networks in priority order (DHCP or static IP per network), follows network changes; default AP `lsu-cmp` / `12345678` at `10.10.10.10` |
 | interfaceId | 0, arbitrary, a single physical CAN channel |
 | Timestamp | laptop time, sent in every SUBSCRIBE |
 
